@@ -12,6 +12,10 @@
 ; 2020-08-01 ver0.2.0 リファクタリング
 ;                     ディスク関係以外のアドレスをオリジナルと合わせた
 ;                     連続空きメモリ134バイト
+; 2020-08-01 ver0.3.0 ディスク関係並べ替え
+;                     IPL ROMからRAMへの切り替えをRAM上で行うようにした
+;                     起動時にWIDTH40にする処理で，8255への出力を追加
+;                     連続空きメモリ118バイト
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -30,7 +34,7 @@
 ; 以下のエントリを固定番地とする
 ; 0066h : NMIリセット(ok)
 ; 00f5h : IPLエラー処理?(未実装)
-; (01cfh : IPL overlay?) 詳細不明なので無視
+; (01cfh : IPL overlay? x1ipl101で固定アドレスとしているが，不要？)
 ; 021ah : IPL用ディスクREAD
 ; 038ah : IPL用KEY入力(ok)
 ; 03cbh : IPL用メッセージ表示(ok)
@@ -48,6 +52,8 @@ TXTCUR  equ     WRKTOP + 0h
 TXTATR  equ     WRKTOP + 6h
 IPLDRV  equ     WRKTOP + 7h
 WRKSIZ  equ     10h                     ; ワークエリアの長さ
+
+REDIRE  equ     0ff78h                  ; IPL ROMからRAMに切り替えるリダイレクタ
 
 FILEBUF equ     0de00h                  ; ファイル読込みバッファ
 
@@ -119,6 +125,10 @@ INIT_CRT_1:
         dec     c
         dec     a
         jp      p, INIT_CRT_1
+
+        ld      bc, IO8255C
+        ld      a, 40h
+        out     (c), a
 INIT_CRT_END:
 
         ; メインループ
@@ -134,9 +144,7 @@ IPL_LOOP:
 
         ld      de, MSG_WAITING
         call    IPLPRN_XY
-        ld      a, (IPLDRV)
-        add     a, 30h
-        call    IPLPTC
+        call    PRT_DRV
 
         call    IS_FDD_READY            ; FDD 0の挿入チェック
         jr      nc, IPL_LOAD
@@ -147,7 +155,7 @@ IPL_LOOP:
         jr      IPL_LOOP
 IPL_LOOP_END:
 
-        ; ここに4バイトあき
+        ; ここに3バイトあき
 
         ; NMIリセットがアドレス066hとなるよう，調整する
         org     054h
@@ -173,6 +181,20 @@ ERR_MISSING_1:
         ; NMIリセットのエントリ
 RST_066H:
         jr      IPL_LOOP
+
+
+; ドライブ番号の表示
+; パラメータ
+;   (0ff80h) TXTCUR カーソルxy
+;   (0ff86h) TXTATR アトリビュート
+; 戻り値
+;   (0ff80h) TXTCUR カーソルxy
+; レジスタ破壊 a
+; 8バイト
+PRT_DRV:
+        ld      a, (IPLDRV)
+        add     a, 30h
+        jp      IPLPTC                  ; 飛び先でリターン
 
 
 ; メニュー表示と選択
@@ -209,14 +231,13 @@ INP_MENU_1:
 
 
 ; ファイルの読込みと実行
+; 76バイト
 IPL_LOAD:
         call    CLR_VRAM_TOP
 
         ld      de, MSG_LOOKING
         call    IPLPRN_XY
-        ld      a, (IPLDRV)
-        add     a, 30h
-        call    IPLPTC
+        call    PRT_DRV
 
         call    LOAD1ST                 ; 先頭セクタの読込み
         jr      nz, ERR_LOAD            ; デバイスがおかしい？
@@ -224,8 +245,6 @@ IPL_LOAD:
         jr      nz, ERR_MISSING         ; フラグ等がおかしい
 
         call    CLR_VRAM_TOP
-        ld      hl, FILEBUF+11h         ; ファイル名の次，パスワード領域
-        ld      (hl), 0                 ; 終端0にする。どうせパスワードをサポートしないので
         ld      de, MSG_LOADING
         call    IPLPRN_XY
         ld      de, FILEBUF+1
@@ -238,21 +257,32 @@ IPL_LOAD:
         ld      hl, (FILEBUF+14h)       ; ロードアドレス
         ld      de, (FILEBUF+1eh)       ; 開始セクタ
         call    LOADFILE
-        jr      nz, ERR_LOAD            ; デバイスがおかしい？
+        jp      nz, ERR_LOAD            ; デバイスがおかしい？
+
+        ; リダイレクタをRAMに書き込む
+        ld      hl, REDIRE
+        ld      (hl), 0edh              ; out (c), a
+        inc     hl
+        ld      (hl), 79h
+        inc     hl
+        ld      (hl), 0e9h              ; jp (hl)
 
         ld      hl, (FILEBUF+16h)       ; 実行アドレス
         ld      bc, IOIPLOF
-        out     (c), a                  ; aの値に依存しない
-        jp      (hl)                    ; IPL終了
+        jp      REDIRE                  ; IPL終了
+IPL_LOAD_END:
 
 
 ; 先頭セクタのチェック
+; パスワード領域を0にし，ファイル名の文字列を0終端にする
 ; 戻り値
 ;   ゼロ : エラーでnz
+; レジスタ破壊 af hl
+; 26バイト
 CHECK1ST:
         ld      hl, FILEBUF
         ld      a, (hl)
-        cp      1
+        dec     a
         ret     nz
         ld      l, 0eh
         ld      a, (hl)
@@ -265,24 +295,18 @@ CHECK1ST:
         inc     hl
         ld      a, (hl)
         cp      's'
+        ret     nz
+        inc     hl                      ; ファイル名の次，パスワード領域
+                                        ; フラグ変化しないのがありがたい
+        ld      (hl), 0                 ; パスワード領域をつぶし，文字列の終端0にする
+                                        ; どうせパスワードをサポートしないので問題なし
         ret
 CHECK1ST_END:
 
 
 ; ----------------------------------------------------------
-; FDD関連ルーチン
+; FDD関連ルーチン その1
 ; ----------------------------------------------------------
-
-; ちょっと待つ
-; 呼び出し元のcall命令含め 146clock = 36.5usec
-; レジスタ破壊 af
-; 6バイト
-; call 17clock
-WAIT1:  ld      a, 7                    ; 7clock
-WAIT2:  dec     a                       ; 4clock
-        jr      nz, WAIT2               ; 12clock
-        ret                             ; 10clock
-
 
 ; FDDの準備確認
 ; パラメータ
@@ -290,6 +314,7 @@ WAIT2:  dec     a                       ; 4clock
 ; 戻り値
 ;   キャリ : 準備未完で1
 ; レジスタ破壊 af bc de
+; 29バイト
 IS_FDD_READY:
         ld      a, (IPLDRV)
         or      80h
@@ -314,6 +339,7 @@ IS_FDD_READY_2:
 
 ; FDCのBusy待ち
 ; レジスタ破壊 af bc
+; 10バイト
 WAIT_FDC_BUSY:
         ld      bc, IOFDCCR
         in      a, (c)
@@ -324,6 +350,7 @@ WAIT_FDC_BUSY:
 
 ; FDCリストア
 ; レジスタ破壊 af bc
+; 11バイト
 FDC_RESTORE:
         ld      a, 2
         ld      bc, IOFDCCR
@@ -337,6 +364,7 @@ FDC_RESTORE:
 ;   a : トラック番号
 ; レジスタ破壊 af bc
 ;   ゼロ : エラーでnz
+; 20バイト
 FDC_SEEK:
         ld      bc, IOFDCDR
         out     (c), a
@@ -355,6 +383,7 @@ FDC_SEEK:
 ;   a : セクタ番号(0オリジン)
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl
+; 41バイト
 FDC_READ:
         ld      bc, IOFDCSR             ; セクタ番号のセット
         inc     a
@@ -387,64 +416,51 @@ FDC_READ_2:
         ret
 
 
-
 ; 先頭セクタの読込み
 ; 戻り値
 ;   ゼロ : エラーでnz
+; 12バイト
 LOAD1ST:
         call    FDC_RESTORE
         ld      hl, FILEBUF
         ld      a, 0
         call    FDC_READ
         ret
+LOAD1ST_END:
+
+; アドレス 176h
+; ここに118バイトのあき
 
 
-; ファイルの読込み
-; パラメータ
-;   a : セクタ数
-;   de : レコード番号(トラック+サイド+セクタ)
-;   hl : 読込みバッファのアドレス
-; レジスタ破壊 af bc de hl af'
-LOADFILE:
-        ex      af, af'                 ; aレジスタ退避
+; ----------------------------------------------------------
+; FDD関連ルーチン その2
+; ----------------------------------------------------------
 
-        ld      a, e
+; アドレスはLOADFILEのエントリアドレスから逆算
+        org     01ech
 
-        ; d←トラック番号+サイド
-        ; d = HIGH(de << 4)
-        rlca
-        rl      d
-        rlca
-        rl      d
-        rlca
-        rl      d
-        rlca
-        rl      d
+; ちょっと待つ
+; 呼び出し元のcall命令含め 146clock = 36.5usec
+; レジスタ破壊 af
+; 6バイト
+; call 17clock
+WAIT1:  ld      a, 7                    ; 7clock
+WAIT2:  dec     a                       ; 4clock
+        jr      nz, WAIT2               ; 12clock
+        ret                             ; 10clock
 
-        ; e←セクタ番号(0オリジン)
-        ld      a, e
-        and     0fh
-        ld      e, a
 
-LOADFILE_1:
-        ; ドライブ番号とサイドを指定してモータON
-        ld      a, 1
-        and     d                       ; f←サイド
-        ld      a, (IPLDRV)
-        jr      z, LOADFILE_2           ; サイド0だった
-        or      10h                     ; サイド1だった
-LOADFILE_2
-        or      80h                     ; モータON
-        ld      bc, IOFDCNO
-        out     (c), a
-
+; ファイルの読込み(本体)
+; エントリアドレスを固定する関係で，後半がここに飛んでいる
+; 40バイト
+LOADFILE_MAIN:
         ; トラックシーク
         ld      a, d
         srl     a
         call    FDC_SEEK                ; シーク
         ret     nz                      ; エラー
 
-LOADFILE_3
+LOADFILE_3:
         ; 1セクタ読込み
         push    de
         ld      a,e
@@ -477,12 +493,55 @@ LOADFILE_4:
         out     (c), a
 
         ret
+LOADFILE_MAIN_END:
+
+
+; ファイルの読込み(アドレス固定)
+; パラメータ
+;   a : セクタ数
+;   de : レコード番号(トラック+サイド+セクタ)
+;   hl : 読込みバッファのアドレス
+; レジスタ破壊 af bc de hl af'
+; 37バイト
+        org 021ah
+LOADFILE:
+        ex      af, af'                 ; aレジスタ退避
+
+        ld      a, e
+
+        ; d←トラック番号+サイド
+        ; d = HIGH(de << 4)
+        rlca
+        rl      d
+        rlca
+        rl      d
+        rlca
+        rl      d
+        rlca
+        rl      d
+
+        ; e←セクタ番号(0オリジン)
+        ld      a, e
+        and     0fh
+        ld      e, a
+
+LOADFILE_1:
+        ; ドライブ番号とサイドを指定してモータON
+        ld      a, 1
+        and     d                       ; f←サイド
+        ld      a, (IPLDRV)
+        jr      z, LOADFILE_2           ; サイド0だった
+        or      10h                     ; サイド1だった
+LOADFILE_2:
+        or      80h                     ; モータON
+        ld      bc, IOFDCNO
+        out     (c), a
+
+        jr      LOADFILE_MAIN
+
 LOADFILE_END:
 
-
-; アドレス 01bah
-; ここに134バイトのあき
-
+; ここに1バイトあき
 
 ; ----------------------------------------------------------
 ; データ領域
@@ -510,7 +569,7 @@ MSG_ERROR:
         db      "Device error"          ; 終端を次と共用
 MSG_WAITING:
         dw      0
-        db      "IPL is waiting for the device ready; FD"       ; 終端を次と共用
+        db      "IPL is waiting for the device FD"              ; 終端を次と共用
 MSG_LOOKING:
         dw      0
         db      "IPL is looking for a program from FD"          ; 終端を次と共用
@@ -550,9 +609,6 @@ PARM40: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 52, 45, 40, 55
 ;PARM80: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 56, 89, 80, 111
 
 DATA_END:
-
-
-; ここに5バイトあき
 
 
 ; ----------------------------------------------------------
