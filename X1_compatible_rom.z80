@@ -12,10 +12,13 @@
 ; 2020-08-01 ver0.2.0 リファクタリング
 ;                     ディスク関係以外のアドレスをオリジナルと合わせた
 ;                     連続空きメモリ134バイト
-; 2020-08-01 ver0.3.0 ディスク関係並べ替え
+; 2020-08-03 ver0.3.0 ディスク関係並べ替え
 ;                     IPL ROMからRAMへの切り替えをRAM上で行うようにした
 ;                     起動時にWIDTH40にする処理で，8255への出力を追加
 ;                     連続空きメモリ118バイト
+; 2020-08-04 ver0.3.1 ディスク関係リファクタリングとデバッグ
+;                     ファイルバッファの位置を直し忘れていた
+;                     ファイルバッファが60K CP/Mに潰されるので対策
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -47,15 +50,16 @@
 
 ; ワークエリアアドレス
 
-WRKTOP  equ     0ff80h                  ; ワークエリアの先頭アドレス
-TXTCUR  equ     WRKTOP + 0h
-TXTATR  equ     WRKTOP + 6h
-IPLDRV  equ     WRKTOP + 7h
-WRKSIZ  equ     10h                     ; ワークエリアの長さ
+WRKTOP  equ     0ff70h                  ; ワークエリアの先頭アドレス
+TXTCUR  equ     WRKTOP + 10h
+TXTATR  equ     WRKTOP + 16h
+IPLDRV  equ     WRKTOP + 17h
+WRKSIZ  equ     20h                     ; ワークエリアの長さ
 
-REDIRE  equ     0ff78h                  ; IPL ROMからRAMに切り替えるリダイレクタ
+REDIREC equ     WRKTOP + 0h             ; IPL ROMからRAMに切り替えるリダイレクタ
+EXECADR equ     REDIREC + 3             ; 実行アドレス
 
-FILEBUF equ     0de00h                  ; ファイル読込みバッファ
+FILEBUF equ     0fe00h                  ; ファイル読込みバッファ
 
 
 ; 以下はturbo BIOSで使用
@@ -149,7 +153,7 @@ IPL_LOOP:
         call    IS_FDD_READY            ; FDD 0の挿入チェック
         jr      nc, IPL_LOAD
 
-        call    CLR_VRAM_TOP
+IPL_LOOP2:
         call    IPL_MENU                ; メニュー表示と入力待ち
 
         jr      IPL_LOOP
@@ -158,7 +162,7 @@ IPL_LOOP_END:
         ; ここに3バイトあき
 
         ; NMIリセットがアドレス066hとなるよう，調整する
-        org     054h
+        org     051h
 
         ; 読込みエラー等 (インライン展開済み)
         ; 12バイト
@@ -171,16 +175,17 @@ ERR_LOAD:
 ERR_LOAD_END:
 
         ; 読み込むべきファイルが見つからないエラー (インライン展開済み)
-        ; 6バイト
+        ; 9バイト
 ERR_MISSING:
         ld      de, MSG_MISSING
 ERR_MISSING_1:
         call    IPLPRN_XY
+        call    WAIT_MOMENT
         ; ループの戻りをNMIリセットと共用
 
-        ; NMIリセットのエントリ
+        ; NMIリセットのエントリ(メニューに戻す)
 RST_066H:
-        jr      IPL_LOOP
+        jr      IPL_LOOP2
 
 
 ; ドライブ番号の表示
@@ -197,14 +202,30 @@ PRT_DRV:
         jp      IPLPTC                  ; 飛び先でリターン
 
 
+; 数秒待つ
+; レジスタ破壊 af bc de
+; 13バイト
+WAIT_MOMENT:
+        ld      b, 10
+        ld      de, 0
+WAIT_MOMENT_1:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, WAIT_MOMENT_1
+        djnz    WAIT_MOMENT_1
+        ret
+
+
 ; メニュー表示と選択
 ; 戻り値
 ;   (0ff87h) IPLDRV ドライブ指定(0～3)
 ; レジスタ破壊 af af' bc de hl
-; 49バイト=表示17バイト+入力20バイト+データ12バイト
+; 40バイト=表示20バイト+入力20バイト (他にデータ14バイト)
 IPL_MENU:
+        call    CLR_VRAM_TOP
         ld      hl, MSG_ADDR_MENU
-        ld      a, 6                    ; メッセージの行数
+        ld      a, 7                    ; メッセージの行数
 IPL_MENU_1:
         ld      e, (hl)
         inc     hl
@@ -231,7 +252,7 @@ INP_MENU_1:
 
 
 ; ファイルの読込みと実行
-; 76バイト
+; 79バイト
 IPL_LOAD:
         call    CLR_VRAM_TOP
 
@@ -244,6 +265,19 @@ IPL_LOAD:
         call    CHECK1ST                ; 起動フラグの確認
         jr      nz, ERR_MISSING         ; フラグ等がおかしい
 
+
+        ; リダイレクタをRAMに書き込む
+        ; 実行アドレスを退避しておかないとCP/Mにバッファを潰される
+        ld      hl, REDIREC
+        ld      (hl), 0edh              ; out (c), a
+        inc     hl
+        ld      (hl), 79h
+        inc     hl
+        ld      (hl), 0c3h              ; jp xxxx
+        ld      hl, (FILEBUF+16h)       ; 実行アドレス
+        ld      (EXECADR), hl
+
+        ; ファイル本体の読込み
         call    CLR_VRAM_TOP
         ld      de, MSG_LOADING
         call    IPLPRN_XY
@@ -259,17 +293,8 @@ IPL_LOAD:
         call    LOADFILE
         jp      nz, ERR_LOAD            ; デバイスがおかしい？
 
-        ; リダイレクタをRAMに書き込む
-        ld      hl, REDIRE
-        ld      (hl), 0edh              ; out (c), a
-        inc     hl
-        ld      (hl), 79h
-        inc     hl
-        ld      (hl), 0e9h              ; jp (hl)
-
-        ld      hl, (FILEBUF+16h)       ; 実行アドレス
         ld      bc, IOIPLOF
-        jp      REDIRE                  ; IPL終了
+        jp      REDIREC                 ; IPL終了
 IPL_LOAD_END:
 
 
@@ -337,25 +362,35 @@ IS_FDD_READY_2:
         ret
 
 
-; FDCのBusy待ち
-; レジスタ破壊 af bc
-; 10バイト
-WAIT_FDC_BUSY:
-        ld      bc, IOFDCCR
-        in      a, (c)
-        and     81h
-        jr      nz, WAIT_FDC_BUSY
-        ret
-
-
 ; FDCリストア
 ; レジスタ破壊 af bc
-; 11バイト
+; 2バイト
 FDC_RESTORE:
         ld      a, 2
+        ; 次のルーチン(FDC_CMD)へ続く
+
+
+; FDCのコマンドレジスタに命令を与え，完了を待つ
+; パラメータ
+;   a : コマンド番号
+; レジスタ破壊 af bc
+; 5バイト
+FDC_CMD:
         ld      bc, IOFDCCR
         out     (c), a
-        call    WAIT_FDC_BUSY
+        ; 次のルーチン(FDC_RESTORE)へ続く
+
+
+; FDCのBusy待ち
+; bcレジスタがIOFDCCRでなければならない
+; bレジスタが0fh(FDCのIOアドレスの上位)でなければならない
+; レジスタ破壊 af bc
+; 7バイト
+WAIT_FDC_BUSY:
+WAIT_FDC_BUSY_1:
+        in      a, (c)
+        and     81h
+        jr      nz, WAIT_FDC_BUSY_1
         ret
 
 
@@ -364,17 +399,26 @@ FDC_RESTORE:
 ;   a : トラック番号
 ; レジスタ破壊 af bc
 ;   ゼロ : エラーでnz
-; 20バイト
+; 15バイト
 FDC_SEEK:
         ld      bc, IOFDCDR
         out     (c), a
         ld      a, 1eh
-        ld      bc, IOFDCCR
-        out     (c), a
-        call    WAIT_FDC_BUSY
+        call    FDC_CMD
         in      a, (c)
         and     99h
         ret
+
+
+; 先頭セクタの読込み
+; 戻り値
+;   ゼロ : エラーでnz
+; 7バイト
+LOAD1ST:
+        call    FDC_RESTORE
+        ld      hl, FILEBUF
+        xor     a
+        ; 次のルーチン(FDC_READ)へ続く
 
 
 ; 1セクタ読込み
@@ -388,6 +432,7 @@ FDC_READ:
         ld      bc, IOFDCSR             ; セクタ番号のセット
         inc     a
         out     (c), a
+        ld      c, LOW(IOFDCCR)
         call    WAIT_FDC_BUSY
 
         ld      d, LOW(IOFDCCR)         ; FDCステータスレジスタ
@@ -414,22 +459,11 @@ FDC_READ_1:
 FDC_READ_2:
         rlca    ; BACK STAT (RRCA <-> RLCA)
         ret
+FDC_READ_END:
 
 
-; 先頭セクタの読込み
-; 戻り値
-;   ゼロ : エラーでnz
-; 12バイト
-LOAD1ST:
-        call    FDC_RESTORE
-        ld      hl, FILEBUF
-        ld      a, 0
-        call    FDC_READ
-        ret
-LOAD1ST_END:
-
-; アドレス 176h
-; ここに118バイトのあき
+; アドレス 17ah
+; ここに114バイトのあき
 
 
 ; ----------------------------------------------------------
@@ -559,6 +593,7 @@ MSG_ADDR_MENU:
         dw      MSG_MENU4
         dw      MSG_MENU5
         dw      MSG_MENU6
+        dw      MSG_MENU7
 
 
 ; 表示メッセージ
@@ -597,9 +632,12 @@ MSG_MENU5:
 MSG_MENU6:
         dw      40*7+13
         db      "M:Mon", 0
+MSG_MENU7:
+        dw      40*8+13
+        db      "#:RAM", 0
 MSG_WELCOME:
         dw      40*23+8
-        db      "X1 compatible IPL 0.2.0", 0
+        db      "X1 compatible IPL 0.3.1", 0
 
 
 ; WIDTH40とWIDTH80のCRTC初期化パラメータ
@@ -610,6 +648,7 @@ PARM40: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 52, 45, 40, 55
 
 DATA_END:
 
+; ここに2バイトあき
 
 ; ----------------------------------------------------------
 ; テキスト関係ルーチン
