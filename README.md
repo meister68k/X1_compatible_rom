@@ -93,7 +93,7 @@ DRAMを使用しているシステムではメモリのウォーミングアッ�
 
 ## 関連プロダクト
 
-X1 compatible ROM ( https://github.com/meister68k/X1_compatible_rom )
+X1互換 8x8ドットフリーフォント ( https://github.com/meister68k/X1_compatible_font )
 
 
 ## 参考文献
