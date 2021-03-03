@@ -26,6 +26,8 @@
 ;                     そもそもオリジナルのROMサイズを1KBだと勘違いしていた
 ;                     (正しくは4KB)
 ; 2020-09-15 コメントのみ修正
+; 2021-03-03 ver0.4.1 ディスクREAD(021ah)にキャリーフラグのクリアを追加
+;                     X-DOS起動不具合対策
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -718,6 +720,7 @@ LOADFILE_MAIN_END:
 ; 37バイト
         org 021ah
 LOADFILE:
+        or      a                       ; キャリークリア
         ex      af, af'                 ; aレジスタ退避
 
         ld      a, e
@@ -754,8 +757,6 @@ LOADFILE_2:
 
 LOADFILE_END:
 
-; ここに1バイトあき
-
 ; ----------------------------------------------------------
 ; データ領域
 ; 計281バイト
@@ -768,7 +769,7 @@ DATA_TOP:
 ; VRAMオフセット(2バイト), "メッセージ本体", 終端0
 MSG_WELCOME:
         dw      40*23+8
-        db      "X1 compatible IPL 0.4.0", 0
+        db      "X1 compatible IPL 0.4.1", 0
 MSG_ERROR:
         dw      40
         db      "Device error"          ; 終端0を次のdw0と共用
