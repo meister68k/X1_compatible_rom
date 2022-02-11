@@ -30,15 +30,16 @@
 ;                     X-DOS起動不具合対策
 ; 2022-02-11 ver0.5.0 CMTブート追加のためのリファクタリング
 ;                     メニューの大文字/小文字を無視するようにした
+; 2022-02-11 ver0.6.0 CMTブート対応
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
 ;
 ; その他の参考文献
-; X1 turbo  BIOSの解析,稲葉 康治,Oh!MZ 1985年1月号,p.97～109
-; IOCS DATA LIST,泉 大介ら,Oh!MZ 1986年11月号,p.76～
-; 試験に出るX1,祝 一平，日本ソフトバンク,1987
-; HuBASIC Format詳細,BouKiCHi,https://boukichi.github.io/HuDisk/HuBASIC_Format.html
+; X1 turbo  BIOSの解析, 稲葉 康治, Oh!MZ 1985年1月号, p.97～109
+; IOCS DATA LIST, 泉 大介ら, Oh!MZ 1986年11月号, p.76～
+; 試験に出るX1, 祝 一平, 日本ソフトバンク, 1987
+; HuBASIC Format詳細, BouKiCHi, https://boukichi.github.io/HuDisk/HuBASIC_Format.html
 ;   2020-07-31 閲覧
 ;
 ; 開発にあたり武田氏のX1エミュレータ eX1 (http://takeda-toshiya.my.coocan.jp/)を
@@ -102,7 +103,7 @@ IOFDCNO equ     0ffch                   ; ドライブNo./サイド/モーター
 IOPALET equ     1200h                   ; パレット
 IOCRTC  equ     1800h                   ; CRTC レジスタ
 IO80C49 equ     1900h                   ; サブCPU
-IO8255B equ     1a01h                   ; 8255 port B
+IO8255B equ     1a01h                   ; 8255 port B (CMT読出し)
 IO8255C equ     1a02h                   ; 8255 port C
 IOIPLOF equ     1e00h                   ; IPL ROM OFF
 IOATTR  equ     2000h                   ; アトリビュートVRAM
@@ -279,13 +280,14 @@ IPL_LOAD:
         ld      de, (FILEBUF+16h)       ; 実行アドレス
         call    WRITE_REDIRECTOR
 
-        ; ファイル本体の読込み
+        ; ファイル名の表示
         call    CLR_VRAM_TOP
         ld      de, MSG_LOADING
         call    IPLPRN_XY
         ld      de, FILEBUF+1
         call    IPLPRN
 
+        ; ファイル本体の読込み
         ld      hl, (FILEBUF+12h)       ; プログラムサイズ(byte)
         dec     hl
         inc     h
@@ -783,11 +785,11 @@ CLR_VRAM_ALL:
         jr      CLR_VRAM_TOP_1          ; 飛び先でリターン
 
 
-; テキストVRAMクリア(上部3行+αだけ) (アドレス変えてもよい)
+; テキストVRAMクリア(上部12行+αだけ) (アドレス変えてもよい)
 ; レジスタ破壊 af bc hl
 ; 5バイト
 CLR_VRAM_TOP:
-        ld      a, 1
+        ld      a, 2
 CLR_VRAM_TOP_1:
         ld      hl, TEXT_STD
         ;jr      CLR_VRAM               ; 次のルーチンなので省略
@@ -989,6 +991,7 @@ LD_TEXT_ADDR_1:
         add     a, b
         ld      b, a
         ret
+LD_TEXT_ADDR_END:
 
 
 ; カーソルアドレス計算
@@ -1116,8 +1119,162 @@ ROM_LOADFILE_END:
 ; CMT関連ルーチン
 ; ----------------------------------------------------------
 
+; CMTからのファイルの読込みと実行
 IPL_CMT:
-        jp      INP_MENU
+        call    CLR_VRAM_TOP           ; 長いメッセージで上書きされるので省略
+
+        ; 状態取得
+        call    MT_STAT
+        or      a
+        jp      z, ERR_LOAD             ; テープ未セット
+
+        ld      de, MSG_WAITING
+        call    IPLPRN_XY
+        ld      de, MSG_LOOKING
+        call    IPLPRN_XY
+        ld      de, MSG_LOOKCMT
+        call    IPLPRN_XY
+
+; IPL中なので割り込み禁止のはず
+;        di                              ; ここから割り込み禁止区間
+        ld      a, 2                    ; 2=再生コマンド
+        call    MT_CTRL                 ; 再生開始
+
+        ld      hl, FILEBUF
+        ld      bc, IO8255B
+
+        call    CMT_LOAD1ST
+        push    af
+
+        ld      a, 1                    ; 1=停止コマンド
+        call    MT_CTRL                 ; 停止
+;        ei                              ; ここまで割り込み禁止区間
+; IPL中なのでずっと割り込み禁止にしてある
+
+        pop     af
+        jp      c, ERR_MISSING          ; ヘッダ部の読込み異常
+
+        call    CHECK1ST                ; 起動フラグの確認
+        jp      nz, ERR_MISSING         ; フラグ等がおかしい
+
+        ; リダイレクタをRAMに書き込む
+        ld      de, (FILEBUF+16h)       ; 実行アドレス
+        call    WRITE_REDIRECTOR
+
+        ; ファイル名の表示
+        call    CLR_VRAM_TOP
+        ld      de, MSG_LOADING
+        call    IPLPRN_XY
+        ld      de, FILEBUF+1
+        call    IPLPRN
+
+        ; ファイル本体の読込み
+        ld      bc, IO8255B
+        ld      de, (FILEBUF+12h)       ; プログラムサイズ(byte)
+        ld      hl, (FILEBUF+14h)       ; ロードアドレス
+        ld      a, 2                    ; 2=再生コマンド
+        call    MT_CTRL                 ; 再生開始
+        call    CMT_LOADFILE
+        push    af
+
+        ld      a, 1                    ; 1=停止コマンド
+        call    MT_CTRL                 ; 停止
+
+        pop     af
+        jp      c, ERR_LOAD             ; 読込み異常
+
+IPL_CMT_1:
+        ; IPL終了
+        ld      bc, IOIPLOF
+        jp      REDIREC                 ; IPL終了
+IPL_CMT_END
+
+
+; CMTインフォメーションブロックの読込み
+; パラメータ
+;   bc : IO8255B (1a01h)
+;   hl : 読込みバッファのアドレス
+; 戻り値
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af de hl
+;
+; 割り込み禁止状態で呼び出すこと
+CMT_LOAD1ST:
+        ; リーダー部の1(不定個数と想定)を読み飛ばす
+        call    MT_SKIP1111
+        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+
+        ; リーダー部の0を40個，読み飛ばす
+        ld      d, 40 - 1               ; 1を読み飛ばす時点で既に1個 読んでいる
+        call    MT_SKIP0
+        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+
+        ; リーダー部の1を41個，読み飛ばす
+        ld      d, 41
+        call    MT_SKIP1
+        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+
+        ; インフォメーションブロック32byte + チェックサム2byte
+        ld      e, 34
+CMT_LOAD1ST_1:
+        call    MT_RDBYTE
+        ld      (hl), d
+        inc     hl
+        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+        dec     e
+        jr      nz, CMT_LOAD1ST_1
+
+CMT_LOAD1ST_EXIT:
+        ret
+CMT_LOAD1ST_END:
+
+
+; CMTデータ本体の読込み
+; パラメータ
+;   bc : IO8255B (1a01h)
+;   de : データ長
+;   hl : 読込みバッファのアドレス
+; 戻り値
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af de hl
+;
+; 割り込み禁止状態で呼び出すこと
+CMT_LOADFILE:
+        push    de
+
+        ; リーダー部の1(不定個数と想定)を読み飛ばす
+        call    MT_SKIP1111
+        jr      c, CMT_LOADFILE_EXIT    ; 異常終了
+
+        ; リーダー部の0を20個，読み飛ばす
+        ld      d, 20 - 1               ; 1を読み飛ばす時点で既に1個 読んでいる
+        call    MT_SKIP0
+        jr      c, CMT_LOADFILE_EXIT    ; 異常終了
+
+        ; リーダー部の1を21個，読み飛ばす
+        ld      d, 21
+        call    MT_SKIP1
+        jr      c, CMT_LOADFILE_EXIT    ; 異常終了
+
+        ; データ本体
+CMT_LOADFILE_1:
+        call    MT_RDBYTE
+        ld      (hl), d
+        inc     hl
+        jr      c, CMT_LOADFILE_EXIT    ; 異常終了
+        pop     de
+        dec     de
+        push    de
+        ld      a, d
+        or      e
+        jr      nz, CMT_LOADFILE_1
+
+CMT_LOADFILE_EXIT:
+        pop     de
+
+        ret
+CMT_LOADFILE_END:
+
 
 ; カセットコントロール
 ; パラメータ
@@ -1130,7 +1287,7 @@ IPL_CMT:
 ;       5 = APSS+1
 ;       6 = APSS-1
 ;       a = WRITE
-; レジスタ破壊 af
+; レジスタ破壊 f
 ; リターン時に割り込み禁止になっている
 MT_CTRL:
         push    bc
@@ -1151,7 +1308,7 @@ MT_CTRL:
 
         pop     bc
         ret
-END_MT_CTRL:
+MT_CTRL_END:
 
 
 ; カセットデッキ状態取得
@@ -1204,8 +1361,172 @@ MT_STAT:
         pop     hl
         pop     bc
         ret
-END_MT_STAT:
+MT_STAT_END:
 
+
+; CMTの信号立ち上がりを待つ
+; パラメータ
+;   bc : IO8255B (1a01h)
+; 戻り値
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af
+MT_EDGE:
+        ; lowを待つ
+        in      a, (c)
+        rrca                            ; 4clock
+        jr      nc, MT_EDGE_2           ; 12clock
+        rrca                            ; 4clock
+        jr      c, MT_EDGE              ; 12clock
+
+MT_EDGE_1:
+        ; 立ち上がりを待つ
+        in      a, (c)
+        rrca                            ; 4clock
+        jr      nc, MT_EDGE_2           ; 12clock
+        rrca                            ; 4clock
+        jr      nc, MT_EDGE_1           ; 12clock
+        ; キャリが残っている
+
+MT_EDGE_2:
+        ccf
+        ret
+MT_EDGE_END:
+
+
+; CMTから1bit読み込む
+; パラメータ
+;   bc : IO8255B (1a01h)
+; 戻り値
+;   a : 読込みデータが0なら0
+;   ゼロ : 読込みデータが0なら0
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af
+MT_RDBIT:
+        call    MT_EDGE
+        jr      c, MT_RDBIT_EXIT        ; 異常終了
+
+        ; 約185usec待つ
+        ld      a, 40                   ; 1ループ約4.5usec
+                                        ; (ROMなので1ウェイト，RAMなら約4usec)
+MT_RDBIT_1:
+        dec     a                       ; 4clock
+        jr      nz, MT_RDBIT_1          ; 12clock
+
+        ; 判定
+        in      a, (c)
+        and     02h
+MT_RDBIT_EXIT:
+        ret
+MT_RDBIT_END:
+
+
+; CMTから1bit読み込み，Dレジスタに入れる
+; パラメータ
+;   bc : IO8255B (1a01h)
+; 戻り値
+;   d : 最下位ビットに読込みデータ，上位7ビットは左シフト
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af d
+MT_RDBIT_D:
+        rlc     d
+        call    MT_RDBIT
+        jr      c, MT_RDBIT_D_EXIT      ; 異常終了
+        jr      z, MT_RDBIT_D_EXIT
+        inc     d
+MT_RDBIT_D_EXIT:
+        ret
+MT_RDBIT_D_END:
+
+
+; CMTの1の連続を読み飛ばす
+; パラメータ
+;   bc : IO8255B (1a01h)
+; 戻り値
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af
+;
+; 最後に0を1つ読むので注意
+MT_SKIP1111:
+        call    MT_RDBIT
+        jr      c, MT_SKIP1111_EXIT     ; 異常終了
+        jr      nz, MT_SKIP1111
+MT_SKIP1111_EXIT:
+        ret
+MT_SKIP1111_END:
+
+
+; CMTの0を指定個数読み飛ばす
+; パラメータ
+;   bc : IO8255B (1a01h)
+;   d : 個数
+; 戻り値
+;   d : 残り個数
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af d
+MT_SKIP0:
+        call    MT_RDBIT
+        jr      c, MT_SKIP0_EXIT        ; 異常終了
+        scf
+        jr      nz, MT_SKIP0_EXIT       ; 異常終了(1が来た)
+        dec     d
+        jr      nz, MT_SKIP0
+
+        or      a                       ; 正常終了
+MT_SKIP0_EXIT:
+        ret
+MT_SKIP0_END:
+
+
+; CMTの1を指定個数読み飛ばす
+; パラメータ
+;   bc : IO8255B (1a01h)
+;   d : 個数
+; 戻り値
+;   d : 残り個数
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af d
+MT_SKIP1:
+        call    MT_RDBIT
+        jr      c, MT_SKIP1_EXIT        ; 異常終了
+        scf
+        jr      z, MT_SKIP1_EXIT        ; 異常終了(0が来た)
+        dec     d
+        jr      nz, MT_SKIP1
+
+        or      a                       ; 正常終了
+MT_SKIP1_EXIT:
+        ret
+MT_SKIP1_END:
+
+
+; CMTから1バイト読み込む
+; パラメータ
+;   bc : IO8255B (1a01h)
+; 戻り値
+;   d : 読込んだデータ
+;   キャリ : BREAKや異常終了なら1
+; レジスタ破壊 af d
+;
+; スタートビット1bit，データ本体8bit
+MT_RDBYTE:
+        call    MT_RDBIT                ; スタートビット
+        jr      c, MT_RDBYTE_EXIT       ; 異常終了
+        scf
+        jr      z, MT_RDBYTE_EXIT       ; 異常終了(スタートビットが無い)
+
+        ld      d, 0
+        call    MT_RDBIT_D              ; 第7ビット
+        call    MT_RDBIT_D              ; 第6ビット
+        call    MT_RDBIT_D              ; 第5ビット
+        call    MT_RDBIT_D              ; 第4ビット
+        call    MT_RDBIT_D              ; 第3ビット
+        call    MT_RDBIT_D              ; 第2ビット
+        call    MT_RDBIT_D              ; 第1ビット
+        call    MT_RDBIT_D              ; 第0ビット
+        ; 異常終了時はキャリが立っている
+MT_RDBYTE_EXIT:
+        ret
+MT_RDBYTE_END:
 
 
 ; ----------------------------------------------------------
@@ -1214,6 +1535,69 @@ END_MT_STAT:
 
 EXEC_MON:
         jp      INP_MENU
+EXEC_MON_END:
+
+
+; #PRINTS
+; 空白を1文字表示する
+; [destruct] F
+MON_PRINTS:
+        push    af
+        ld      a, ' '
+        call    IPLPTC
+        pop     af
+        ret
+MON_PRINTS_END:
+
+
+; #PRTHX
+; Aレジスタの内容を2桁の16進数として表示する
+; [in]  A : binary
+; [destruct] AF
+MON_PRTHX:
+        push    af
+        rrca
+        rrca
+        rrca
+        rrca
+        call    MON_PRTHX_1
+        pop     af
+MON_PRTHX_1:
+        call    MON_ASC
+        jp      IPLPTC
+        ; omit RET
+MON_PRTHX_AND:
+
+
+; #PRTHL
+; print HL registor as 4 digit HEX
+; [in]  HL : binary
+; [destruct] AF
+MON_PRTHL:
+        ld      a, h
+        call    MON_PRTHX
+        ld      a, l
+        jr      MON_PRTHX
+        ; omit RET
+MON_PRTHL_END:
+
+
+; #ASC
+; binary to ASCII convert
+; [in]  A : binary (low nibble)
+; [out] A : ASCII code ('0' - '9', 'A' - 'F')
+; [destruct] AF
+MON_ASC:
+        and     0fh
+
+        cp      10
+        ccf
+        adc     a, 30h
+        daa
+
+        ret
+MON_ASC_END:
+; ------------------
 
 
 ; ----------------------------------------------------------
@@ -1227,7 +1611,7 @@ DATA_TOP:
 ; VRAMオフセット(2バイト), "メッセージ本体", 終端0
 MSG_WELCOME:
         dw      40*23+8
-        db      "X1 compatible IPL 0.5.0", 0
+        db      "X1 compatible IPL 0.6.0", 0
 MSG_ERROR:
         dw      40
         db      "Device error", 0
@@ -1237,6 +1621,9 @@ MSG_WAITING:
 MSG_LOOKING:
         dw      7                                           ; "IPL is "の部分を省略
         db      "looking for a program from FD", 0
+MSG_LOOKCMT:
+        dw      34                                          ; "IPL is ～ from "までをFD用から拝借
+        db      "CMT", 0
 MSG_LOADING:
         dw      0
         db      "IPL is loading ", 0
