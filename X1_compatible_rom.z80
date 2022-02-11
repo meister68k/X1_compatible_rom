@@ -31,6 +31,9 @@
 ; 2022-02-11 ver0.5.0 CMTブート追加のためのリファクタリング
 ;                     メニューの大文字/小文字を無視するようにした
 ; 2022-02-11 ver0.6.0 CMTブート対応
+; 2022-02-11 ver0.6.1 CMTブート時のリーダ部(1の連続)の読み飛ばし方法を変更
+;                     ファイル名拡張子(.Sys)のチェックをやめた
+;                     RuinousXIII起動不具合対策
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -381,28 +384,29 @@ WRITE_REDIRECTOR:
 ; 戻り値
 ;   ゼロ : エラーでnz
 ; レジスタ破壊 af hl
-; 26バイト
+; 10バイト
 CHECK1ST:
-        ld      hl, FILEBUF
-        ld      a, (hl)
-        dec     a
-        ret     nz
-        ld      l, 0eh
-        ld      a, (hl)
-        cp      'S'
-        ret     nz
-        inc     hl
-        ld      a, (hl)
-        cp      'y'
-        ret     nz
-        inc     hl
-        ld      a, (hl)
-        cp      's'
-        ret     nz
-        inc     hl                      ; ファイル名の次，パスワード領域
-                                        ; フラグ変化しないのがありがたい
+        ld      hl, FILEBUF + 11h       ; パスワード領域
         ld      (hl), 0                 ; パスワード領域をつぶし，文字列の終端0にする
                                         ; どうせパスワードをサポートしないので問題なし
+        ld      l, LOW(FILEBUF)         ; 起動フラグ
+        ld      a, (hl)
+        dec     a
+;        ret     nz
+;        ld      l, 0eh
+;        ld      a, (hl)
+;        cp      'S'
+;        ret     nz
+;        inc     hl
+;        ld      a, (hl)
+;        cp      'y'
+;        ret     nz
+;        inc     hl
+;        ld      a, (hl)
+;        cp      's'
+;        ret     nz
+;        inc     hl                      ; ファイル名の次，パスワード領域
+;                                        ; フラグ変化しないのがありがたい
         ret
 CHECK1ST_END:
 
@@ -639,7 +643,7 @@ EMM_READ_4:
         ret
 EMM_READ_END:
 
-; ここに5バイトのあき
+; ここに21バイトのあき
 
 ; ----------------------------------------------------------
 ; FDD関連ルーチン その2
@@ -1157,16 +1161,16 @@ IPL_CMT:
         call    CHECK1ST                ; 起動フラグの確認
         jp      nz, ERR_MISSING         ; フラグ等がおかしい
 
-        ; リダイレクタをRAMに書き込む
-        ld      de, (FILEBUF+16h)       ; 実行アドレス
-        call    WRITE_REDIRECTOR
-
         ; ファイル名の表示
         call    CLR_VRAM_TOP
         ld      de, MSG_LOADING
         call    IPLPRN_XY
         ld      de, FILEBUF+1
         call    IPLPRN
+
+        ; リダイレクタをRAMに書き込む
+        ld      de, (FILEBUF+16h)       ; 実行アドレス
+        call    WRITE_REDIRECTOR
 
         ; ファイル本体の読込み
         ld      bc, IO8255B
@@ -1406,7 +1410,8 @@ MT_RDBIT:
         jr      c, MT_RDBIT_EXIT        ; 異常終了
 
         ; 約185usec待つ
-        ld      a, 40                   ; 1ループ約4.5usec
+;        ld      a, 40                   ; 1ループ約4.5usec
+        ld      a, 35                   ; 1ループ約4.5usec
                                         ; (ROMなので1ウェイト，RAMなら約4usec)
 MT_RDBIT_1:
         dec     a                       ; 4clock
@@ -1438,7 +1443,7 @@ MT_RDBIT_D_EXIT:
 MT_RDBIT_D_END:
 
 
-; CMTの1の連続を読み飛ばす
+; CMTの255個以上の1の連続を探して読み飛ばす
 ; パラメータ
 ;   bc : IO8255B (1a01h)
 ; 戻り値
@@ -1447,10 +1452,26 @@ MT_RDBIT_D_END:
 ;
 ; 最後に0を1つ読むので注意
 MT_SKIP1111:
+        push    de
+
+        ; 255個の連続を探す
+MT_SKIP1111_1:
+        ld      d, 0ffh
+MT_SKIP1111_2:
         call    MT_RDBIT
         jr      c, MT_SKIP1111_EXIT     ; 異常終了
-        jr      nz, MT_SKIP1111
+        jr      z, MT_SKIP1111_1        ; 0が来たのでカウントリセット
+        dec     d
+        jr      nz, MT_SKIP1111_2
+
+        ; 残りを読み飛ばす
+MT_SKIP1111_3:
+        call    MT_RDBIT
+        jr      c, MT_SKIP1111_EXIT     ; 異常終了
+        jr      nz, MT_SKIP1111_3
+
 MT_SKIP1111_EXIT:
+        pop     de
         ret
 MT_SKIP1111_END:
 
@@ -1611,7 +1632,7 @@ DATA_TOP:
 ; VRAMオフセット(2バイト), "メッセージ本体", 終端0
 MSG_WELCOME:
         dw      40*23+8
-        db      "X1 compatible IPL 0.6.0", 0
+        db      "X1 compatible IPL 0.6.1", 0
 MSG_ERROR:
         dw      40
         db      "Device error", 0
