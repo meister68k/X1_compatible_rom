@@ -28,6 +28,8 @@
 ; 2020-09-15 コメントのみ修正
 ; 2021-03-03 ver0.4.1 ディスクREAD(021ah)にキャリーフラグのクリアを追加
 ;                     X-DOS起動不具合対策
+; 2022-02-11 ver0.5.0 CMTブート追加のためのリファクタリング
+;                     メニューの大文字/小文字を無視するようにした
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -186,7 +188,7 @@ IPL_LOOP2:
         jr      IPL_LOOP
 IPL_LOOP_END:
 
-        ; ここに1バイトあき
+; ここに1バイトあき
 
         ; NMIリセットがアドレス066hとなるよう，調整する
         org     051h
@@ -303,11 +305,12 @@ IPL_LOAD_END:
 ; 戻り値
 ;   (0ff87h) IPLDRV ドライブ指定(0～3)
 ; レジスタ破壊 af af' bc de hl
-; 58バイト=表示20バイト+入力38バイト (他にデータ14バイト)
+; 65バイト=表示20バイト+入力45バイト
 IPL_MENU:
         call    CLR_VRAM_TOP
         ld      hl, MSG_ADDR_MENU
-        ld      a, 7                    ; メッセージの行数
+        ld      a, (hl)                 ; メッセージの行数
+        inc     hl
 IPL_MENU_1:
         ld      e, (hl)
         inc     hl
@@ -322,24 +325,26 @@ IPL_MENU_1:
 INP_MENU:
         call    IPLKEY
 
-        cp      'M'                     ; モニタ
-;        jp      z, EXEC_MON            ; 未実装
-        nop
-        nop
-        nop
-
         cp      '#'                     ; RAMから起動(謎機能)
         jp      z, EXEC_RAM
+
+        or      20h                     ; 全て小文字に統一
 
         sub     30h
         jp      m, INP_MENU
         cp      3                       ; FDD(0-3)
         jp      m, INP_MENU_1
 
-        cp      'R' - 30h               ; BASIC ROM(CZ-8RB)
+        cp      'c' - 30h               ; CMTから起動
+        jp      z, IPL_CMT
+
+        cp      'e' - 30h               ; EMMから起動
         jr      z, INP_MENU_1
 
-        cp      'E' - 30h               ; EMMから起動
+        cp      'm' - 30h               ; モニタ
+        jp      z, EXEC_MON
+
+        cp      'r' - 30h               ; BASIC ROM(CZ-8RB)
         jr      z, INP_MENU_1
 
         jr      INP_MENU
@@ -348,6 +353,7 @@ INP_MENU_1:
         ld      hl, IPLDRV
         ld      (hl), a
         ret
+INP_MENU_END:
 
 
 ; リダイレクタをRAMに書き込む
@@ -451,7 +457,7 @@ FDC_RESTORE:
 FDC_CMD:
         ld      bc, IOFDCCR
         out     (c), a
-        ; 次のルーチン(FDC_RESTORE)へ続く
+        ; 次のルーチン(WAIT_FDC_BUSY)へ続く
 
 
 ; FDCのBusy待ち
@@ -563,13 +569,13 @@ LOADFILE_COM_END:
 
 ; EMMまたはROMから先頭セクタを読みだす
 ; パラメータ
-;   a : IPLDRVの内容(22hの場合BASIC ROM)
+;   a : IPLDRVの内容(42hの場合BASIC ROM)
 ; 22バイト
 EMM_LOAD1ST:
         ld      hl, FILEBUF
         ld      bc, IOEMM_L
 
-        cp      'R' - 30h               ; ROMモード？
+        cp      'r' - 30h               ; ROMモード？
         jr      nz, EMM_LOAD1ST_1
         ld      b, HIGH(IOROM_H)
 
@@ -631,21 +637,7 @@ EMM_READ_4:
         ret
 EMM_READ_END:
 
-; ----------------------------------------------------------
-; 追加機能ルーチン(1)
-; ----------------------------------------------------------
-
-; RAM 0番地のプログラムを実行する
-; turboのIPLの隠し機能……らしい
-; 9バイト
-EXEC_RAM:
-        ; リダイレクタをRAMに書き込む
-        ld      de, 0
-        call    WRITE_REDIRECTOR
-        jp      IPL_LOAD_1              ; IPL終了
-EXEC_RAM_EMD:                           ; アドレス 01e9h
-
-; ここに3バイトのあき
+; ここに5バイトのあき
 
 ; ----------------------------------------------------------
 ; FDD関連ルーチン その2
@@ -718,7 +710,7 @@ LOADFILE_MAIN_END:
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl af'
 ; 37バイト
-        org 021ah
+        org     021ah
 LOADFILE:
         or      a                       ; キャリークリア
         ex      af, af'                 ; aレジスタ退避
@@ -757,77 +749,7 @@ LOADFILE_2:
 
 LOADFILE_END:
 
-; ----------------------------------------------------------
-; データ領域
-; 計281バイト
-; ----------------------------------------------------------
-        org     0240h
-DATA_TOP:
-
-; 表示メッセージ
-; 合計 255バイト以下とする(現在250バイト)
-; VRAMオフセット(2バイト), "メッセージ本体", 終端0
-MSG_WELCOME:
-        dw      40*23+8
-        db      "X1 compatible IPL 0.4.1", 0
-MSG_ERROR:
-        dw      40
-        db      "Device error"          ; 終端0を次のdw0と共用
-MSG_WAITING:
-        dw      0
-        db      "IPL is waiting for the device FD",0
-MSG_LOOKING:
-        dw      7                                           ; "IPL is "の部分を省略
-        db      "looking for a program from FD"             ; 終端0を次のdw0と共用
-MSG_LOADING:
-        dw      0
-        db      "IPL is loading ",0
-MSG_MISSING:
-        dw      40
-        db      "Program not found",0
-MSG_MENU1:
-        dw      9
-        db      "Make Your device ready", 0
-MSG_MENU2:
-        dw      40*2+2
-        db      "Press selected key to start driving:", 0
-MSG_MENU3:
-        dw      40*4+11
-        db      "0-3:FDD", 0
-MSG_MENU4:
-        dw      40*5+13
-        db      "R:ROM", 0
-MSG_MENU5:
-        dw      40*6+13
-        db      "E:EMM", 0
-MSG_MENU6:
-        dw      40*7+13
-        db      "M:Mon", 0
-MSG_MENU7:
-        dw      40*8+13
-        db      "#:RAM", 0
-MSG_END:
-
-; メニューの表示内容
-; 12バイト
-MSG_ADDR_MENU:
-        dw      MSG_MENU1
-        dw      MSG_MENU2
-        dw      MSG_MENU3
-        dw      MSG_MENU4
-        dw      MSG_MENU5
-        dw      MSG_MENU6
-        dw      MSG_MENU7
-
-; WIDTH40とWIDTH80のCRTC初期化パラメータ
-; レジスタR13から逆順にR0まで
-; 14バイト
-PARM40: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 52, 45, 40, 55
-;PARM80: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 56, 89, 80, 111
-
-DATA_END:
-
-; ここに5バイトあき
+; ここに283バイトあき(MENUデータを追い出したので)
 
 ; ----------------------------------------------------------
 ; FDD・EMM共通ルーチン
@@ -1088,21 +1010,39 @@ ST_CUR_ADDR_END:
 ; ここに1バイトあき
 
 ; ----------------------------------------------------------
+; ここまでで1KB
+; ----------------------------------------------------------
+
+        org     0400h
+
+; ----------------------------------------------------------
+; 追加機能ルーチン(1)
+; ----------------------------------------------------------
+
+; RAM 0番地のプログラムを実行する
+; turboのIPLの隠し機能……らしい
+; 9バイト
+EXEC_RAM:
+        ; リダイレクタをRAMに書き込む
+        ld      de, 0
+        call    WRITE_REDIRECTOR
+        jp      IPL_LOAD_1              ; IPL終了
+EXEC_RAM_EMD:                           ; アドレス 01e9h
+
+; ----------------------------------------------------------
 ; EMM・BASIC ROM関連ルーチン(2)
 ; ----------------------------------------------------------
 
-        org     0400h                   ; 1KB突破
-
 ; EMMファイルの読込み
 ; パラメータ
-;   a : IPLDRVの内容(22hの場合BASIC ROM)
+;   a : IPLDRVの内容(42hの場合BASIC ROM)
 ;   c : セクタ数
 ;   de : レコード番号(アドレス / 256)
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl af' ix
 ; 28バイト
 EMM_LOADFILE:
-        cp      'R' - 30h               ; ROMモード？
+        cp      'r' - 30h               ; ROMモード？
         jr      z, ROM_LOADFILE
 
         push    bc                      ; セクタ数を退避
@@ -1173,10 +1113,179 @@ ROM_LOADFILE_END:
 
 
 ; ----------------------------------------------------------
+; CMT関連ルーチン
+; ----------------------------------------------------------
+
+IPL_CMT:
+        jp      INP_MENU
+
+; カセットコントロール
+; パラメータ
+;   a : コマンド
+;       0 = EJECT
+;       1 = STOP
+;       2 = READ
+;       3 = FF
+;       4 = REW
+;       5 = APSS+1
+;       6 = APSS-1
+;       a = WRITE
+; レジスタ破壊 af
+; リターン時に割り込み禁止になっている
+MT_CTRL:
+        push    bc
+        push    af
+
+        ei                              ; サブCPUとの通信時に必要？
+        call    WAIT_80C49_WR
+        ld      bc, IO80C49
+        ld      a, 0e9h                 ; e9=カセットデッキコントロール
+        out     (c), a
+        call    WAIT_80C49_WR
+        di
+
+        call    WAIT_80C49_WR
+        ld      bc, IO80C49
+        pop     af
+        out     (c), a
+
+        pop     bc
+        ret
+END_MT_CTRL:
+
+
+; カセットデッキ状態取得
+; 戻り値
+;   a : 下位4bit
+;       0 = EJECT
+;       1 = STOP
+;       2 = READ
+;       3 = FF
+;       4 = REW
+;       a = WRITE
+;   a : 上位4bit
+;       10 = テープ回転中(1)/停止中(0)
+;       20 = テープセット済み(1)/未セット(0)
+;       40 = 録音防止(1)/書込み可(0)
+; レジスタ破壊 af
+; リターン時に割り込み禁止になっている
+MT_STAT:
+        push    bc
+        push    hl
+
+        ei                              ; サブCPUとの通信時に必要？
+        call    WAIT_80C49_WR
+        ld      bc, IO80C49
+        ld      a, 0ebh                 ; eb=カセットセンサー読出し
+        out     (c), a
+        call    WAIT_80C49_WR
+        di
+
+        call    READ_80C49              ; a←カセットセンサー
+        and     07h
+        rlca
+        rlca
+        rlca
+        rlca
+        ld      h, a
+
+        ei                              ; サブCPUとの通信時に必要？
+        call    WAIT_80C49_WR
+        ld      bc, IO80C49
+        ld      a, 0eah                 ; ea=カセットデッキ状態読出し
+        out     (c), a
+        call    WAIT_80C49_WR
+        di
+
+        call    READ_80C49              ; a←デッキ状態
+        and     0fh
+        or      h
+
+        pop     hl
+        pop     bc
+        ret
+END_MT_STAT:
+
+
+
+; ----------------------------------------------------------
 ; マシン語モニタ
 ; ----------------------------------------------------------
 
-        org     0440h
-
 EXEC_MON:
+        jp      INP_MENU
 
+
+; ----------------------------------------------------------
+; データ領域
+; 計384バイト
+; ----------------------------------------------------------
+        org     0680h
+DATA_TOP:
+
+; 表示メッセージ
+; VRAMオフセット(2バイト), "メッセージ本体", 終端0
+MSG_WELCOME:
+        dw      40*23+8
+        db      "X1 compatible IPL 0.5.0", 0
+MSG_ERROR:
+        dw      40
+        db      "Device error", 0
+MSG_WAITING:
+        dw      0
+        db      "IPL is waiting for the device FD", 0
+MSG_LOOKING:
+        dw      7                                           ; "IPL is "の部分を省略
+        db      "looking for a program from FD", 0
+MSG_LOADING:
+        dw      0
+        db      "IPL is loading ", 0
+MSG_MISSING:
+        dw      40
+        db      "Program not found", 0
+MSG_MENU1:
+        dw      9
+        db      "Make Your device ready", 0
+MSG_MENU2:
+        dw      40*2+2
+        db      "Press selected key to start driving:", 0
+MSG_MENU3:
+        dw      40*4+11
+        db      "0-3:FDD", 0
+MSG_MENU4:
+        dw      40*5+13
+        db      "C:CMT", 0
+MSG_MENU5:
+        dw      40*6+13
+        db      "R:ROM", 0
+MSG_MENU6:
+        dw      40*7+13
+        db      "E:EMM", 0
+MSG_MENU7:
+        dw      40*8+13
+        db      "M:Mon", 0
+MSG_MENU8:
+        dw      40*9+13
+        db      "#:RAM", 0
+MSG_END:
+
+; メニューの表示内容
+; 17バイト
+MSG_ADDR_MENU:
+        db      8                       ; メニューの行数
+        dw      MSG_MENU1
+        dw      MSG_MENU2
+        dw      MSG_MENU3
+        dw      MSG_MENU4
+        dw      MSG_MENU5
+        dw      MSG_MENU6
+        dw      MSG_MENU7
+        dw      MSG_MENU8
+
+; WIDTH40とWIDTH80のCRTC初期化パラメータ
+; レジスタR13から逆順にR0まで
+; 28バイト
+PARM40: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 52, 45, 40, 55
+PARM80: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 56, 89, 80, 111
+
+DATA_END:
