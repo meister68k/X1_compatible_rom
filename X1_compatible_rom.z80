@@ -34,23 +34,28 @@
 ; 2022-02-11 ver0.6.1 CMTブート時のリーダ部(1の連続)の読み飛ばし方法を変更
 ;                     ファイル名拡張子(.Sys)のチェックをやめた
 ;                     RuinousXIII起動不具合対策
+; 2022-02-20 ver0.7.0 ROMブートの不具合修正
+;                     ブートセクタの開始アドレスをオフセット1dhからの3バイトに修正
+;                     (元は1ehからの2バイト)
+;                     EMMとROMのルーチン共用をやめ内部構造が大きく変わったため，バージョン番号を上げた
+;                     デバッグ支援用にモニタの実装を開始
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
 ;
 ; その他の参考文献
-; X1 turbo  BIOSの解析, 稲葉 康治, Oh!MZ 1985年1月号, p.97～109
-; IOCS DATA LIST, 泉 大介ら, Oh!MZ 1986年11月号, p.76～
-; 試験に出るX1, 祝 一平, 日本ソフトバンク, 1987
-; HuBASIC Format詳細, BouKiCHi, https://boukichi.github.io/HuDisk/HuBASIC_Format.html
+; [1] X1 turbo  BIOSの解析, 稲葉 康治, Oh!MZ 1985年1月号, p.97～109
+; [2] IOCS DATA LIST, 泉 大介ら, Oh!MZ 1986年11月号, p.76～
+; [3] 試験に出るX1, 祝 一平, 日本ソフトバンク, 1987
+; [4] HuBASIC Format詳細, BouKiCHi, https://boukichi.github.io/HuDisk/HuBASIC_Format.html
 ;   2020-07-31 閲覧
 ;
 ; 開発にあたり武田氏のX1エミュレータ eX1 (http://takeda-toshiya.my.coocan.jp/)を
 ; 全面的に使用した。eX1の強力なデバッグ機能のお陰でこのプラグラムを作りえた。
 
 
-; FDD0-3およびROM，EMM，RAMからの起動を実装した
-; CMT，Timer関係を実装しない
+; FDD0-3およびROM，EMM，RAM，CMTからの起動を実装した
+; Timer関係を実装しない
 ; モニタの実装が未着手
 
 ; 以下のエントリを固定番地とする
@@ -69,49 +74,67 @@
 
 ; ワークエリアアドレス
 
-WRKTOP  equ     0ff80h                  ; ワークエリアの先頭アドレス
-TXTCUR  equ     WRKTOP + 0h             ; カーソルxy
-;               WRKTOP + 2h             ; 初期化後の0を維持すること
-;               WRKTOP + 3h             ; 初期化後の0を維持すること
-;               WRKTOP + 4h             ; 初期化後の0を維持すること
-TXTATR  equ     WRKTOP + 6h             ; テキスト色
-IPLDRV  equ     WRKTOP + 7h             ; ドライブ番号
+WRKTOP          equ     0ff80h          ; ワークエリアの先頭アドレス
+TXTCUR          equ     WRKTOP + 0h     ; カーソルxy
+;                       WRKTOP + 2h     ; 初期化後の0を維持すること
+;                       WRKTOP + 3h     ; 初期化後の0を維持すること
+;                       WRKTOP + 4h     ; 初期化後の0を維持すること
+TXTATR          equ     WRKTOP + 6h     ; テキスト色
+IPLDRV          equ     WRKTOP + 7h     ; ドライブ番号
                                         ;(ただしROM起動の場合22h，EMM起動の場合15h)
-WRKSIZ  equ     20h                     ; ワークエリアの長さ
+WRKSIZ          equ     20h             ; ワークエリアの長さ
 
-REDIREC equ     WRKTOP + 10h            ; IPL ROMからRAMに切り替えるリダイレクタ
-EXECADR equ     REDIREC + 3             ; 実行アドレス
+REDIREC         equ     WRKTOP + 10h    ; IPL ROMからRAMに切り替えるリダイレクタ
+EXECADR         equ     REDIREC + 3     ; 実行アドレス
+INPBUF          equ     WRKTOP + 10h    ; モニタの入力文字列用バッファ(リダイレクタ領域と共用)
+INPSIZ          equ     0eh             ; モニタの入力文字列用バッファの長さ
+MONADR          equ     WRKTOP + 1eh    ; モニタのアクセス中アドレス
 
-FILEBUF equ     0fe00h                  ; ファイル読込みバッファ
+FILEBUF         equ     0fe00h          ; ファイル読込みバッファ
+                                        ; +00h ブートフラグ(1バイト)
+                                        ; +01h ファイル名(13バイト)
+                                        ;      拡張子と連続で扱う。間のごみが表示されてもご愛敬
+                                        ; +0eh 拡張子(3バイト)
+                                        ;      参考文献[4]によれば'Sys'でなければならないが，チェックをやめた
+                                        ; +11h パスワード(1バイト)
+                                        ;      無視。0を書き込んで文字列終端にしている
+                                        ; +12h サイズ(2バイト)
+                                        ; +14h 読込みアドレス(2バイト)
+                                        ; +16h 実行アドレス(2バイト)
+                                        ; +18h 日付(6バイト)
+                                        ; +1dh ディスク上のオフセット(3バイト)
+                                        ;      参考文献[4]によれば+1dhが未使用，+1ehが開始セクタとなっているが，
+                                        ;      +1dhからの3バイトでオフセットバイト数を示し，
+                                        ;      1セクタ256バイトのFDDやEMMでは常に+1dhに00が入っていると考えるとCZ-8RBとの整合が取れる
 
 
 ; 以下はturbo BIOSで使用
-COLORF  equ     0f8d0h
-CLSCHR  equ     0f8d1h
+COLORF          equ     0f8d0h
+CLSCHR          equ     0f8d1h
 
 ; IOアドレス
-IOEMM_L equ     0d00h                   ; EMM アドレス上位
-IOEMM_M equ     0d01h                   ; EMM アドレス中位
-IOEMM_H equ     0d02h                   ; EMM アドレス下位
-IOEMM   equ     0d03h                   ; EMM データ読み書き
-IOROM_H equ     0e00h                   ; BASIC ROMボード アドレス上位
-IOROM_M equ     0e01h                   ; BASIC ROMボード アドレス中位
-IOROM_L equ     0e02h                   ; BASIC ROMボード アドレス下位
-IOROM   equ     0e03h                   ; BASIC ROMボード データ読出し
-IOFDCCR equ     0ff8h                   ; FDC コマンドレジスタ
-IOFDCTR equ     0ff9h                   ; FDC トラックレジスタ
-IOFDCSR equ     0ffah                   ; FDC セクタレジスタ
-IOFDCDR equ     0ffbh                   ; FDC データレジスタ
-IOFDCNO equ     0ffch                   ; ドライブNo./サイド/モーターON
-IOPALET equ     1200h                   ; パレット
-IOCRTC  equ     1800h                   ; CRTC レジスタ
-IO80C49 equ     1900h                   ; サブCPU
-IO8255B equ     1a01h                   ; 8255 port B (CMT読出し)
-IO8255C equ     1a02h                   ; 8255 port C
-IOIPLOF equ     1e00h                   ; IPL ROM OFF
-IOATTR  equ     2000h                   ; アトリビュートVRAM
-IOTEXT  equ     3000h                   ; テキストVRAM
-TXTSIZ  equ     800h                    ; テキストVRAMのサイズ
+IOEMM_L         equ     0d00h           ; EMM アドレス下位
+IOEMM_M         equ     0d01h           ; EMM アドレス中位
+IOEMM_H         equ     0d02h           ; EMM アドレス上位
+IOEMM           equ     0d03h           ; EMM データ読み書き
+IOROM_H         equ     0e00h           ; BASIC ROMボード アドレス上位
+IOROM_M         equ     0e01h           ; BASIC ROMボード アドレス中位
+IOROM_L         equ     0e02h           ; BASIC ROMボード アドレス下位
+IOROM           equ     0e03h           ; BASIC ROMボード データ読出し
+IOFDCCR         equ     0ff8h           ; FDC コマンドレジスタ
+IOFDCTR         equ     0ff9h           ; FDC トラックレジスタ
+IOFDCSR         equ     0ffah           ; FDC セクタレジスタ
+IOFDCDR         equ     0ffbh           ; FDC データレジスタ
+IOFDCNO         equ     0ffch           ; ドライブNo./サイド/モーターON
+IOPALET         equ     1200h           ; パレット
+IOCRTC          equ     1800h           ; CRTC レジスタ
+IO80C49         equ     1900h           ; サブCPU
+IO8255B         equ     1a01h           ; 8255 port B (CMT読出し)
+IO8255C         equ     1a02h           ; 8255 port C
+IOIPLOF         equ     1e00h           ; IPL ROM OFF
+IOATTR          equ     2000h           ; アトリビュートVRAM
+IOTEXT          equ     3000h           ; テキストVRAM
+TXTSIZ          equ     800h            ; テキストVRAMのサイズ
 
 ; IOATTRとIOTEXTで異なるビット位置
 ; log2((IOATTR ^ IOTEXT) >> 8)
@@ -188,7 +211,6 @@ IPL_LOOP:
 
 IPL_LOOP2:
         call    IPL_MENU                ; メニュー表示と入力待ち
-
         jr      IPL_LOOP
 IPL_LOOP_END:
 
@@ -242,6 +264,7 @@ CLR_PALET:
 ; 戻り値
 ;   (0ff80h) TXTCUR カーソルxy
 ; レジスタ破壊 a
+; FDD以外では表示がおかしくなる(しかしEMMとROMは一瞬なので気にしない)
 ; 8バイト
 PRT_DRV:
         ld      a, (IPLDRV)
@@ -262,22 +285,27 @@ WAIT_MOMENT_1:
         jr      nz, WAIT_MOMENT_1
         djnz    WAIT_MOMENT_1
         ret
+WAIT_MOMENT_END:
 
 
 ; ファイルの読込みと実行
-; 69バイト
+; ??バイト
 IPL_LOAD:
 ;        call    CLR_VRAM_TOP           ; 長いメッセージで上書きされるので省略
-
         ld      de, MSG_LOOKING
         call    IPLPRN_XY
         call    PRT_DRV
+        ld      a, (IPLDRV)
+        cp      12h                     ; CMTの場合メッセージが異なる
+        jr      nz, IPL_LOAD_0
+        ld      de, MSG_LOOKCMT
+        call    IPLPRN_XY
 
-        call    LOAD1ST                 ; 先頭セクタの読込み
+IPL_LOAD_0:
+        call    LOAD1ST_COM             ; 先頭セクタの読込み
         jr      nz, ERR_LOAD            ; デバイスがおかしい？
         call    CHECK1ST                ; 起動フラグの確認
         jr      nz, ERR_MISSING         ; フラグ等がおかしい
-
 
         ; リダイレクタをRAMに書き込む
         ld      de, (FILEBUF+16h)       ; 実行アドレス
@@ -290,13 +318,15 @@ IPL_LOAD:
         ld      de, FILEBUF+1
         call    IPLPRN
 
+        ld      a, (IPLDRV)
+        cp      12h                     ; CMTの場合別処理
+        jp      z, IPL_CMT
+
         ; ファイル本体の読込み
-        ld      hl, (FILEBUF+12h)       ; プログラムサイズ(byte)
-        dec     hl
-        inc     h
-        ld      c, h                    ; セクタ数(256で割っている)
+        ld      bc, (FILEBUF+12h)       ; プログラムサイズ(byte)
         ld      hl, (FILEBUF+14h)       ; ロードアドレス
-        ld      de, (FILEBUF+1eh)       ; 開始セクタ
+        ld      a,  (FILEBUF+1dh)       ; 開始アドレス下位バイト
+        ld      de, (FILEBUF+1eh)       ; 開始アドレス中・上位バイト(ほぼそのままセクタ)
         call    LOADFILE_COM
         jp      nz, ERR_LOAD            ; デバイスがおかしい？
 
@@ -308,9 +338,9 @@ IPL_LOAD_END:
 
 ; メニュー表示と選択
 ; 戻り値
-;   (0ff87h) IPLDRV ドライブ指定(0～3)
+;   (0ff87h) IPLDRV ドライブ指定(0～3，10h=EMM，11h=ROM，12h=CMT)
 ; レジスタ破壊 af af' bc de hl
-; 65バイト=表示20バイト+入力45バイト
+; ??バイト=表示20バイト+入力??バイト
 IPL_MENU:
         call    CLR_VRAM_TOP
         ld      hl, MSG_ADDR_MENU
@@ -333,32 +363,52 @@ INP_MENU:
         cp      '#'                     ; RAMから起動(謎機能)
         jp      z, EXEC_RAM
 
-        or      20h                     ; 全て小文字に統一
+        call    SET_IPLDRV
+        ret     nc                      ; 正常
 
-        sub     30h
-        jp      m, INP_MENU
-        cp      3                       ; FDD(0-3)
-        jp      m, INP_MENU_1
-
-        cp      'c' - 30h               ; CMTから起動
-        jp      z, IPL_CMT
-
-        cp      'e' - 30h               ; EMMから起動
-        jr      z, INP_MENU_1
-
-        cp      'm' - 30h               ; モニタ
+        cp      'm'                     ; モニタ
         jp      z, EXEC_MON
 
-        cp      'r' - 30h               ; BASIC ROM(CZ-8RB)
-        jr      z, INP_MENU_1
-
-        jr      INP_MENU
-
-INP_MENU_1:
-        ld      hl, IPLDRV
-        ld      (hl), a
-        ret
+        jr      INP_MENU                ; 無効文字
 INP_MENU_END:
+
+
+; ドライブ文字をIPLDRVに変換
+; パラメータ
+;   a : ドライブ文字
+; 戻り値
+;   (0ff87h) IPLDRV ドライブ指定(0～3，10h=EMM，11h=ROM，12h=CMT)
+;   キャリ : 無効文字
+;   a : 無効文字の場合に小文字化した元の文字
+; レジスタ破壊 af bc
+; ??バイト
+SET_IPLDRV:
+        cp      34h                     ; FDD(0-3)
+        jr      c, SET_IPLDRV_2
+
+        or      20h                     ; 全て小文字に統一
+
+        ld      b, 40h                  ; IPLDRV = 10h
+        cp      'e'                     ; EMMから起動
+        jr      z, SET_IPLDRV_1
+
+        inc     b                       ; IPLDRV = 11h
+        cp      'r'                     ; BASIC ROM(CZ-8RB)
+        jr      z, SET_IPLDRV_1
+
+        inc     b                       ; IPLDRV = 12h
+        cp      'c'                     ; CMTから起動
+
+        scf
+        ret     nz                      ; 無効文字
+SET_IPLDRV_1:
+        ld      a, b
+SET_IPLDRV_2:
+        sub     30h
+        ret     c                       ; 無効文字
+        ld      (IPLDRV), a
+        ret
+SET_IPLDRV_END:
 
 
 ; リダイレクタをRAMに書き込む
@@ -377,6 +427,7 @@ WRITE_REDIRECTOR:
         ld      (hl), 0c3h              ; jp xxxx
         ld      (EXECADR), de
         ret
+WRITE_REDIRECTOR_END:
 
 
 ; 先頭セクタのチェック
@@ -418,14 +469,17 @@ CHECK1ST_END:
 ; FDDの準備確認
 ; パラメータ
 ;   (0ff87h) IPLDRV ドライブ指定(0～3)
-;            ただし11h以上の場合，FDD以外が指定されたとみなして
-;            無条件で準備完了(ノンキャリ)を返す
+;            ただし12hの場合，CMTをチェック
+;            その他4以上の場合無条件で準備完了(ノンキャリ)を返す
 ; 戻り値
 ;   キャリ : 準備未完で1
 ; レジスタ破壊 af bc de
 ; 31バイト
 IS_FDD_READY:
-        call    IS_BOOT_FDD
+        ld      a, (IPLDRV)
+        cp      12h
+        jp      z, IS_CMT_READY         ; CMTの場合
+        cp      4
         jr      nc, IS_FDD_READY_2
         or      80h
         ld      bc, IOFDCNO
@@ -477,6 +531,7 @@ WAIT_FDC_BUSY_1:
         and     81h
         jr      nz, WAIT_FDC_BUSY_1
         ret
+WAIT_FDC_BUSY_END:
 
 
 ; FDCシーク
@@ -493,18 +548,32 @@ FDC_SEEK:
         in      a, (c)
         and     99h
         ret
+FDC_SEEK_END:
 
 
 ; 先頭セクタの読込み
 ; パラメータ
-;   (0ff87h) IPLDRV 11h以上の場合，MEM_LOAD1STに飛ぶ
+;   (0ff87h) IPLDRV ドライブに応じて処理を振り分け
+; 戻り値
+;   ゼロ : エラーでnz
+; レジスタ破壊 af bc de hl
+; ??バイト
+LOAD1ST_COM:
+        ld      a, (IPLDRV)
+        cp      4
+        jr      c, LOAD1ST              ; FDDの場合
+        cp      12h
+        jp      z, CMT_LOAD1ST          ; CMTの場合
+        jp      EMM_LOAD1ST             ; EMM・ROM共通
+LOAD1ST_END:
+
+
+; 先頭セクタの読込み
 ; 戻り値
 ;   ゼロ : エラーでnz
 ; レジスタ破壊 af bc de hl
 ; 12バイト
 LOAD1ST:
-        call    IS_BOOT_FDD
-        jr      nc, EMM_LOAD1ST
         call    FDC_RESTORE
         ld      hl, FILEBUF
         xor     a
@@ -559,98 +628,36 @@ FDC_READ_END:
 ; ファイルの読込み(FDD・EMM・ROM共通)
 ; IPLDRVの内容に応じて飛び先を変える
 ; パラメータ
-;   (0ff87h) IPLDRV 11h以上の場合，FDD以外
-;   c : セクタ数
-;   de : レコード番号(トラック+サイド+セクタ)
+;   (0ff87h) IPLDRV ドライブに応じて処理を振り分け
+;   bc : 読込みバイト数
+;   de+a : 開始オフセット
+;   (FDDとEMMの場合 de : レコード番号(トラック+サイド+セクタ))
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl af'
-; 9バイト
+; ??バイト
 LOADFILE_COM:
-        call    IS_BOOT_FDD
-        jp      nc, EMM_LOADFILE
-        ld      a, c
+        ld      ixh, a                  ; 未定義命令
+        ld      a, (IPLDRV)
+        cp      11h                     ; ROM
+        jr      c, LOADFILE_COM_1       ; FDDかEMM
+
+        ld      a, ixh                  ; 未定義命令
+        jp      ROM_LOADFILE            ; ROM
+
+LOADFILE_COM_1:
+        ; FDDとEMMの場合
+        dec     bc                      ; バイト数からセクタ数を計算(256で割っている)
+        inc     b
+        cp      10h
+        ld      a, b
+
+        jp      z, EMM_LOADFILE         ; EMM
         jr      LOADFILE
 LOADFILE_COM_END:
-
-
-; EMMまたはROMから先頭セクタを読みだす
-; パラメータ
-;   a : IPLDRVの内容(42hの場合BASIC ROM)
-; 22バイト
-EMM_LOAD1ST:
-        ld      hl, FILEBUF
-        ld      bc, IOEMM_L
-
-        cp      'r' - 30h               ; ROMモード？
-        jr      nz, EMM_LOAD1ST_1
-        ld      b, HIGH(IOROM_H)
-
-EMM_LOAD1ST_1:
-        xor     a
-
-        out     (c), a                  ; 読出しアドレスのセット
-        inc     c                       ; ROMは上位・中位・下位，EMMは下位・中位・上位
-        out     (c), a
-        inc     c
-        out     (c), a
-        inc     c
-        ; 次のルーチン(EMM_READ)へ続く
-EMM_LOAD1ST_END:
-
-
-; EMM・ROM 1セクタ(256byte)読込み
-; ボードへのアドレス設定が終わっているものとする
-; パラメータ
-;   bc : 読出しポート
-;   b : モード(0eh = ROM(オートインクリメント無し)，その他 = オートインクリメント)
-;   hl : 読込みバッファのアドレス
-; 戻り値
-;   hl : 読込みバッファの最終アドレス+1
-;   ゼロ : 常に0
-; レジスタ破壊 af d hl ix
-; 31バイト
-EMM_READ:
-        ld      ix, EMM_READ_4          ; EMMの場合の分岐アドレス
-
-        ld      a, b                    ; ROMの場合は別処理
-        cp      HIGH(IOROM)
-        jr      nz, EMM_READ_1
-
-        ld      ix, EMM_READ_3          ; ROMの場合の分岐アドレス
-
-EMM_READ_1:
-        xor     a
-        ld      d, a                    ; d : カウンタ
-
-EMM_READ_2:
-        in      a, (c)
-        ld      (hl), a
-        inc     hl
-
-        jp      (ix)                    ; EMMとROMで分岐
-
-EMM_READ_3:                             ; ROMの場合のみ
-        dec     c                       ; 読出しポートの前が下位アドレス
-        ld      a, d
-        inc     a
-        out     (c), a
-        inc     c
-
-EMM_READ_4:
-        inc     d
-        jr      nz, EMM_READ_2
-
-        ret
-EMM_READ_END:
-
-; ここに21バイトのあき
 
 ; ----------------------------------------------------------
 ; FDD関連ルーチン その2
 ; ----------------------------------------------------------
-
-; アドレスはLOADFILEのエントリアドレスから逆算
-        org     01ech
 
 ; ちょっと待つ
 ; 呼び出し元のcall命令含め 146clock = 36.5usec
@@ -709,6 +716,8 @@ LOADFILE_4:
 LOADFILE_MAIN_END:
 
 
+; ここに16バイトのあき
+
 ; ファイルの読込み(アドレス固定)
 ; パラメータ
 ;   a : セクタ数
@@ -755,27 +764,65 @@ LOADFILE_2:
 
 LOADFILE_END:
 
-; ここに283バイトあき(MENUデータを追い出したので)
-
 ; ----------------------------------------------------------
-; FDD・EMM共通ルーチン
+; EMM・ROM共通ルーチン
 ; ----------------------------------------------------------
-; 先頭アドレスをIPLKEYのアドレスから逆算
-        org     035bh
 
-; 起動ドライブがFDDか？
+; EMMまたはROMのIOアドレスをセットする
 ; パラメータ
-;   (0ff87h) IPLDRV 11h以上の場合，FDD以外
+;   ゼロ : ROMの時にセット
 ; 戻り値
-;   キャリ : FDDなら1
-;   a : IPLDRVの内容
+;   bc : IOアドレス(IOEMM_L，IOROM_H)
 ; レジスタ破壊 af
-; 6バイト
-IS_BOOT_FDD:
-        ld      a, (IPLDRV)
-        cp      11h
+; 7バイト
+EMM_SETIO:
+        ld      bc, IOEMM_L
+        ret     nz                      ; 条件リターンは好きではないが
+        ld      b, HIGH(IOROM_H)
         ret
-IS_BOOT_FDD_END:
+END_EMM_SETIO:
+
+; EMMまたはROMから先頭32バイトを読みだす
+; パラメータ
+;   ゼロ : ROMの場合セット
+; ??バイト
+EMM_LOAD1ST:
+        cp      11h                     ; ROMの場合
+        call    EMM_SETIO
+        ld      ix, EMM_LOAD1ST_2       ; EMMの場合の分岐アドレス
+        jr      nz, EMM_LOAD1ST_1
+        ld      ix, EMM_LOAD1ST_3       ; ROMの場合の分岐アドレス
+EMM_LOAD1ST_1:
+        xor     a
+
+        out     (c), a                  ; 読出しアドレスに0をセット
+        inc     c                       ; ROMは上位・中位・下位，EMMは下位・中位・上位
+        out     (c), a
+        inc     c
+        out     (c), a
+        inc     c
+
+        ; bcは読出しアドレスになっている
+        ld      hl, FILEBUF
+EMM_LOAD1ST_2:
+        ini                             ; in tmp,(c) ; ld (hl),tmp ; dec b ; inc hl
+        inc     b
+        inc     a
+        cp      0x20
+        jr      z, EMM_LOAD1ST_4
+
+        jp      (ix)                    ; EMMとROMで分岐
+EMM_LOAD1ST_3:                          ; ROMの場合のみ
+        dec     c                       ; 読出しポートの前が下位アドレス
+        out     (c), a
+        inc     c
+        jr      EMM_LOAD1ST_2
+
+EMM_LOAD1ST_4:
+
+        ret
+EMM_LOAD1ST_END:
+
 
 ; ----------------------------------------------------------
 ; テキスト関係ルーチン
@@ -783,8 +830,10 @@ IS_BOOT_FDD_END:
 
 ; テキストVRAMクリア(全画面) (アドレス変えてもよい)
 ; レジスタ破壊 af bc hl
-; 4バイト
+; 10バイト
 CLR_VRAM_ALL:
+        ld      hl, 0
+        ld      (TXTCUR), hl
         ld      a, HIGH(TXTSIZ)
         jr      CLR_VRAM_TOP_1          ; 飛び先でリターン
 
@@ -824,6 +873,7 @@ CLR_VRAM_2:                             ; アトリビュートを256バイト�
         dec     a
         jr      nz, CLR_VRAM_1          ; 256*aバイト分のループ
         ret
+CLR_VRAM_END:
 
 
 ; 80C49(サブCPU)の書込み可能待ち (アドレス変えてもよい)
@@ -837,30 +887,6 @@ WAIT_80C49_WR_1:
         jr      nz, WAIT_80C49_WR_1
         ret
 WAIT_80C49_WR_END:
-
-
-; IPL用KEY入力 (アドレス固定)
-; 戻り値
-;   a : KEYコード
-; レジスタ破壊 af
-; 24バイト
-        org     038ah
-IPLKEY:
-        push    bc
-
-        ei                              ; サブCPUとの通信時に必要？
-        call    WAIT_80C49_WR
-        ld      bc, IO80C49
-        ld      a, 0e6h                 ; e6=キー入力
-        out     (c), a
-        call    WAIT_80C49_WR
-        di
-
-        call    READ_80C49              ; a←ファンクションキー(読み捨て)
-        call    READ_80C49              ; a←ASCII
-
-        pop     bc
-        ret
 
 
 ; 80C49(サブCPU)の読出し
@@ -880,9 +906,52 @@ READ_80C49_1:
 READ_80C49_END:
 
 
-; アドレス 03b1h
-; ここに1バイトあき
-        nop
+; ここに200バイトぐらい??あき(MENUデータを追い出したので)
+
+
+; IPL用KEY入力 (アドレス固定)
+; キー入力を待つ
+; 戻り値
+;   a : KEYコード
+; レジスタ破壊 af
+; ??バイト
+        org     038ah
+IPLKEY:
+        push    bc
+
+IPLKEY_1:
+        call    KBHIT
+        or      a
+        jr      nz, IPLKEY_1            ; 連続しないよう，キーアップを確認する
+
+IPLKEY_2:
+        call    KBHIT
+        or      a
+        jr      z, IPLKEY_2
+
+        pop     bc
+        ret
+IPLKEY_END
+
+
+; IPL用KEY入力 (待たない)
+; 戻り値
+;   a : KEYコード
+; レジスタ破壊 af bc
+; ??バイト
+KBHIT:
+        ei                              ; サブCPUとの通信時に必要？
+        call    WAIT_80C49_WR
+        ld      bc, IO80C49
+        ld      a, 0e6h                 ; e6=キー入力
+        out     (c), a
+        call    WAIT_80C49_WR
+        di
+
+        call    READ_80C49              ; a←ファンクションキー(読み捨て)
+        call    READ_80C49              ; a←ASCII
+        ret
+KBHIT_END
 
 
 ; IPL用メッセージ表示(座標指定)
@@ -926,6 +995,7 @@ IPL_PUTCHAR:
         ret
 IPL_PUTCHAR_END:
 
+; ここに3バイトあき
 
 ; IPL用メッセージ表示 (アドレス固定)
 ; パラメータ
@@ -1023,6 +1093,184 @@ ST_CUR_ADDR_END:
         org     0400h
 
 ; ----------------------------------------------------------
+; テキスト関連追加
+; ----------------------------------------------------------
+
+; 改行
+; パラメータ
+;   (0ff80h) TXTCUR カーソルxy
+; 戻り値
+;   (0ff80h) TXTCUR カーソルxy
+; レジスタ破壊 f
+;
+; WIDTH40を仮定
+; TXTCUR + (40 - X) = TXTCUR - (X - 40) を求めたい
+TXT_LTNL:
+        push    hl
+
+        call    TXT_ISLAST              ; HLに(TXTCUR)が入る
+        jr      c, TXT_LTNL_3
+        push    de
+        push    hl
+
+        ; X座標を得る(40で割った余り)
+        ld      de, 40
+        or      a
+TXT_LTNL_1:
+        sbc     hl, de
+        jr      nc, TXT_LTNL_1
+
+        ex      de, hl
+        ; DE = X - 40 となっている
+
+        ; TXTCUR - DE = TXTCUR - (X - 40)
+        pop     hl
+        or      a
+        sbc     hl, de
+        pop     de
+
+TXT_LTNL_2:
+        ld      (TXTCUR), hl
+        pop     hl
+        ret
+
+TXT_LTNL_3:
+        ; 最終行だった
+        push    bc
+        ld      h, a
+        call    TXT_SCROLL              ; スクロールアップ
+        ld      a, h
+        pop     bc
+
+        ld      hl, 40 * 24             ; 最終行
+        jr      TXT_LTNL_2
+TXT_LTNL_END:
+
+
+; バックスペース
+; パラメータ
+;   (0ff80h) TXTCUR カーソルxy
+; 戻り値
+;   (0ff80h) TXTCUR カーソルxy
+; レジスタ破壊 af bc hl
+TXT_BS:
+        ld      hl, (TXTCUR)
+        dec     hl
+        ld      (TXTCUR), hl
+        push    hl
+
+        call    MON_PRINTS
+        call    MON_PRINTS
+        pop     hl
+        ld      (TXTCUR), hl
+
+        ret
+TXT_BS_END:
+
+
+; カーソル表示
+; パラメータ
+;   (0ff80h) TXTCUR カーソルxy
+; レジスタ破壊 af bc hl
+TXT_CURON:
+        call    LD_TEXT_ADDR
+        res     BIT_ATTR_TEXT, b        ; アトリビュートアドレスに変換
+                                        ; 例えば 30aah → 20aah
+        ld      a, (TXTATR)
+        xor     10h
+        out     (c), a
+
+        ret
+TXT_CURON_END:
+
+
+; カーソル位置が最終行か？
+; パラメータ
+;   (0ff80h) TXTCUR カーソルxy
+; 戻り値
+;   hl : TXTCUR
+;   キャリ : 
+; レジスタ破壊 hl
+; WIDTH40を仮定
+; ??バイト
+TXT_ISLAST:
+        or      a
+        push    af
+
+        ld      hl, (TXTCUR)
+        ld      a, h
+        cp      HIGH(40 * 24)
+        jr      nz, TXT_ISLAST_1
+        ld      a, l
+        cp      LOW(40 * 24)
+        jr      c, TXT_ISLAST_1
+
+        ; 最終行だった
+        pop     af
+        scf
+        ret
+TXT_ISLAST_1:
+        pop     af
+        ret
+TXT_ISLAST_END:
+
+
+; 強制スクロールアップ
+; レジスタ破壊 af bc
+; WIDTH40を仮定
+; ??バイト
+TXT_SCROLL:
+        push    ix
+        ld      bc, IOTEXT              ; 転送先
+        exx                             ; →裏
+        push    bc
+        ld      bc, IOATTR + 40         ; 転送元
+
+TXT_SCROLL_1:
+        in      a, (c)                  ; アトリビュート読出し
+        ld      ixh, a                  ; 未定義命令
+        set     BIT_ATTR_TEXT, b        ; テキストアドレスに変換
+                                        ; 例えば 20aah → 30aah
+        in      a, (c)                  ; テキスト読出し
+        res     BIT_ATTR_TEXT, b        ; アトリビュートアドレスに変換
+        inc     bc
+
+        exx                             ; →表
+        out     (c), a                  ; テキスト書込み
+        res     BIT_ATTR_TEXT, b        ; アトリビュートアドレスに変換
+        ld      a, ixh                  ; 未定義命令
+        out     (c), a                  ; アトリビュート書込み
+        set     BIT_ATTR_TEXT, b        ; テキストアドレスに変換
+        inc     bc
+
+        exx                             ; →裏
+        ld      a, b                    ; 転送範囲チェック
+        cp      HIGH(IOATTR + 40 * 25)
+        jr      nz, TXT_SCROLL_1
+        ld      a, c
+        cp      LOW(IOATTR + 40 * 25)
+        jr      nz, TXT_SCROLL_1
+
+        ; 転送ループ終了
+        pop     bc
+        exx                             ; →表
+        pop     ix
+        ; BC = 最終行の頭(IOTEXT + 40 * 24)のはず
+
+        ; 最終行+αをクリア(64バイト分)
+        ld      a, HIGH(TEXT_STD)
+        call    TXT_SCROLL_2            ; テキストで実行
+        ld      a, LOW(TEXT_STD)
+        ld      bc, IOATTR + 40 * 24    ; アトリビュートで実行
+TXT_SCROLL_2:
+        out     (c), a
+        inc     c
+        jr      nz, TXT_SCROLL_2
+        ret
+TXT_SCROLL_END:
+
+
+; ----------------------------------------------------------
 ; 追加機能ルーチン(1)
 ; ----------------------------------------------------------
 
@@ -1042,37 +1290,33 @@ EXEC_RAM_EMD:                           ; アドレス 01e9h
 
 ; EMMファイルの読込み
 ; パラメータ
-;   a : IPLDRVの内容(42hの場合BASIC ROM)
-;   c : セクタ数
-;   de : レコード番号(アドレス / 256)
+;   a : セクタ数
+;   de : レコード番号(トラック+サイド+セクタ)
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl af' ix
-; 28バイト
+; ??バイト
 EMM_LOADFILE:
-        cp      'r' - 30h               ; ROMモード？
-        jr      z, ROM_LOADFILE
+        ex      af, af'                 ; セクタ数を退避
 
-        push    bc                      ; セクタ数を退避
-
+        xor     a
         ld      bc, IOEMM_L
-
-        xor     a                       ; アドレス 下位
-        out     (c), a
+        out     (c), a                  ; アドレス 下位
         inc     c
-
-        ld      a, e                    ; アドレス 中位
-        out     (c), a
+        out     (c), e                  ; アドレス 中位
         inc     c
-
-        ld      a, d                    ; アドレス 上位
-        out     (c), a
+        out     (c), d                  ; アドレス 上位
         inc     c                       ; bcは読出しアドレス
 
-        pop     de                      ; セクタ数
+        ex      af, af'                 ; セクタ数を復帰
+        ld      d, a
 
-EMM_LOADFILE_1:
-        call    EMM_READ
-        dec     e
+EMM_LOADFILE_1:                         ; 1セクタ256バイト読込み
+        ini                             ; in tmp,(c) ; ld (hl),tmp ; dec b ; inc hl
+        inc     b
+        inc     a
+        jr      nz, EMM_LOADFILE_1
+
+        dec     d                       ; 残りセクタ数の確認
         jr      nz, EMM_LOADFILE_1
 
         ret
@@ -1081,41 +1325,59 @@ EMM_LOADFILE_END:
 
 ; ROMファイルの読込み
 ; パラメータ
-;   c : セクタ数
-;   de : レコード番号(アドレス / 256)
+;   bc : 読込みバイト数
+;   de+a : 開始オフセット
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl af' ix
-; 29バイト
+; ??バイト
 ROM_LOADFILE:
-        ld      a, c                    ; 裏aにセクタ数を退避
-        ex      af, af'
+        ex      de, hl                  ; deがバッファアドレス，hlがアドレス上位中位
+        push    bc                      ; バイト数を退避
 
-ROM_LOADFILE_1:
         ld      bc, IOROM_H
-
-        ld      a, d                    ; アドレス 上位
-        out     (c), a
+        out     (c), h                  ; アドレス 上位
         inc     c
-
-        ld      a, e                    ; アドレス 中位
-        out     (c), a
+        out     (c), l                  ; アドレス 中位
         inc     c
+        out     (c), a                  ; アドレス 下位
 
-        xor     a                       ; アドレス 下位
-        out     (c), a
-        inc     c                       ; bcは読出しアドレス
+        ex      (sp), hl                ; アドレス上位中位を保存し，バイト数を戻す
+        ex      de, hl                  ; deが読込みバイト数，hlがバッファアドレス
+ROM_LOADFILE_1:
+        inc     c                       ; bcは読出しIOアドレス
+        ini                             ; in tmp,(c) ; ld (hl),tmp ; dec b ; inc hl
+        inc     b
 
-        push    de
-        call    EMM_READ
-        pop     de
-
+        dec     de                      ; 残りバイト数の確認
         ex      af, af'
-        dec     a
-        ret     z
+        ld      a, d
+        or      e
+        jr      z, ROM_LOADFILE_2
         ex      af, af'
 
-        inc     de
+        ; ROMはオートインクリメントしてくれない
+        dec     c                       ; 読出しポートの前が下位アドレス
+        inc     a
+        out     (c), a
+        jr      nz, ROM_LOADFILE_1
+
+        ; 下位アドレスがオーバーフロー
+        ex      (sp), hl                ; バッファアドレスを保存し，アドレスを戻す
+
+        inc     hl
+        ld      bc, IOROM_H
+        out     (c), h                  ; アドレス 上位
+        inc     c
+        out     (c), l                  ; アドレス 中位
+        inc     c
+
+        ex      (sp), hl                ; アドレスを保存し，バッファアドレスを戻す
+
         jr      ROM_LOADFILE_1
+
+ROM_LOADFILE_2:
+        pop     bc
+        ret
 ROM_LOADFILE_END:
 
 
@@ -1123,55 +1385,22 @@ ROM_LOADFILE_END:
 ; CMT関連ルーチン
 ; ----------------------------------------------------------
 
-; CMTからのファイルの読込みと実行
-IPL_CMT:
-        call    CLR_VRAM_TOP           ; 長いメッセージで上書きされるので省略
 
+; CMTの準備確認
+; 戻り値
+;   キャリ : 準備未完で1
+; レジスタ破壊 af
+; ??バイト
+IS_CMT_READY:
         ; 状態取得
         call    MT_STAT
-        or      a
-        jp      z, ERR_LOAD             ; テープ未セット
+        dec     a                       ; テープ未セットで0
+        ret
+IS_CMT_END:
 
-        ld      de, MSG_WAITING
-        call    IPLPRN_XY
-        ld      de, MSG_LOOKING
-        call    IPLPRN_XY
-        ld      de, MSG_LOOKCMT
-        call    IPLPRN_XY
 
-; IPL中なので割り込み禁止のはず
-;        di                              ; ここから割り込み禁止区間
-        ld      a, 2                    ; 2=再生コマンド
-        call    MT_CTRL                 ; 再生開始
-
-        ld      hl, FILEBUF
-        ld      bc, IO8255B
-
-        call    CMT_LOAD1ST
-        push    af
-
-        ld      a, 1                    ; 1=停止コマンド
-        call    MT_CTRL                 ; 停止
-;        ei                              ; ここまで割り込み禁止区間
-; IPL中なのでずっと割り込み禁止にしてある
-
-        pop     af
-        jp      c, ERR_MISSING          ; ヘッダ部の読込み異常
-
-        call    CHECK1ST                ; 起動フラグの確認
-        jp      nz, ERR_MISSING         ; フラグ等がおかしい
-
-        ; ファイル名の表示
-        call    CLR_VRAM_TOP
-        ld      de, MSG_LOADING
-        call    IPLPRN_XY
-        ld      de, FILEBUF+1
-        call    IPLPRN
-
-        ; リダイレクタをRAMに書き込む
-        ld      de, (FILEBUF+16h)       ; 実行アドレス
-        call    WRITE_REDIRECTOR
-
+; CMTからのファイルの読込みと実行(後半)
+IPL_CMT:
         ; ファイル本体の読込み
         ld      bc, IO8255B
         ld      de, (FILEBUF+12h)       ; プログラムサイズ(byte)
@@ -1194,6 +1423,29 @@ IPL_CMT_1:
 IPL_CMT_END
 
 
+CMT_LOAD1ST:
+; IPL中なので割り込み禁止のはず
+;        di                              ; ここから割り込み禁止区間
+        ld      a, 2                    ; 2=再生コマンド
+        call    MT_CTRL                 ; 再生開始
+
+        ld      hl, FILEBUF
+        ld      bc, IO8255B
+
+        call    CMT_LOADIFB
+        push    af
+
+        ld      a, 1                    ; 1=停止コマンド
+        call    MT_CTRL                 ; 停止
+;        ei                              ; ここまで割り込み禁止区間
+; IPL中なのでずっと割り込み禁止にしてある
+
+        pop     af
+
+        ret
+CMT_LOAD1ST_END:
+
+
 ; CMTインフォメーションブロックの読込み
 ; パラメータ
 ;   bc : IO8255B (1a01h)
@@ -1203,34 +1455,34 @@ IPL_CMT_END
 ; レジスタ破壊 af de hl
 ;
 ; 割り込み禁止状態で呼び出すこと
-CMT_LOAD1ST:
+CMT_LOADIFB:
         ; リーダー部の1(不定個数と想定)を読み飛ばす
         call    MT_SKIP1111
-        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+        jr      c, CMT_LOADIFB_EXIT     ; 異常終了
 
         ; リーダー部の0を40個，読み飛ばす
         ld      d, 40 - 1               ; 1を読み飛ばす時点で既に1個 読んでいる
         call    MT_SKIP0
-        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+        jr      c, CMT_LOADIFB_EXIT     ; 異常終了
 
         ; リーダー部の1を41個，読み飛ばす
         ld      d, 41
         call    MT_SKIP1
-        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+        jr      c, CMT_LOADIFB_EXIT     ; 異常終了
 
         ; インフォメーションブロック32byte + チェックサム2byte
         ld      e, 34
-CMT_LOAD1ST_1:
+CMT_LOADIFB_1:
         call    MT_RDBYTE
         ld      (hl), d
         inc     hl
-        jr      c, CMT_LOAD1ST_EXIT     ; 異常終了
+        jr      c, CMT_LOADIFB_EXIT     ; 異常終了
         dec     e
-        jr      nz, CMT_LOAD1ST_1
+        jr      nz, CMT_LOADIFB_1
 
-CMT_LOAD1ST_EXIT:
+CMT_LOADIFB_EXIT:
         ret
-CMT_LOAD1ST_END:
+CMT_LOADIFB_END:
 
 
 ; CMTデータ本体の読込み
@@ -1555,26 +1807,208 @@ MT_RDBYTE_END:
 ; ----------------------------------------------------------
 
 EXEC_MON:
-        jp      INP_MENU
+        call    CLR_VRAM_ALL
+
+EXEC_MON_1:
+        ld      a, '*'
+        call    IPLPTC
+        call    MON_GETS
+
+        ld      hl, INPBUF
+        ld      a, (hl)                 ; コマンドの先頭
+        or      20h                     ; 全て小文字に統一
+        inc     hl
+        call    MON_SKIP_SPC            ; 空白を読み飛ばす
+
+        cp      '#'                     ; 画面クリア
+        jr      z, EXEC_MON
+
+        cp      'b'                     ; ブートセクタ読込み
+        jr      z, MON_LOAD1ST
+
+        cp      'd'                     ; ダンプ
+        jr      z, MON_DUMP
+
+        cp      'g'                     ; 実行(RAMに切り替え)
+        jr      z, EXEC_MON_1
+
+        cp      'j'                     ; 実行(ROMのまま)
+        jr      z, EXEC_MON_1
+
+        cp      'r'                     ; 終了
+        jp      z, IPL_LOOP
+
+        jr      EXEC_MON_1
 EXEC_MON_END:
+
+
+; ダンプコマンド
+; パラメータ
+;   hl : パラメータ文字列
+;   (0ff9eh) MONADR モニタアクセス中アドレス
+; 戻り値
+;   (0ff9eh) MONADR モニタアクセス中アドレス
+; レジスタ破壊 af bc de hl
+MON_DUMP:
+        ld      a, (hl)
+        ex      de, hl
+
+        ld      hl, (MONADR)            ; 指定がないので#MONADRを使う
+        or      a
+MON_DUMP_1:
+        call    nz, MON_HLHEX           ; エラーならキャリ
+        jr      c, EXEC_MON_1
+
+        ld      c, 16
+MON_DUMP_2:
+        call    MON_DUMP1
+        dec     c
+        jr      nz, MON_DUMP_2
+
+        ld      (MONADR), hl
+
+        jr      EXEC_MON_1
+MON_DUMP_END:
+
+
+; 1行ダンプコマンド
+; パラメータ
+;   hl : アドレス
+; レジスタ破壊 af bc de hl
+MON_DUMP1:
+        call    MON_PRTHL
+        ld      a, ':'
+        call    IPLPTC
+
+        ; 16進表示
+        push    hl
+        ld      b, 8
+MON_DUMP1_1:
+        ld      a, (hl)
+        call    MON_PRTHX
+        call    MON_PRINTS
+        inc     hl
+        djnz    MON_DUMP1_1
+
+        ld      a, '/'
+        call    IPLPTC
+
+        ; 文字表示
+        pop     hl
+        ld      b, 8
+MON_DUMP1_2:
+        ld      a, (hl)
+        call    IPLPTC
+        inc     hl
+        djnz    MON_DUMP1_2
+
+        call    TXT_LTNL
+
+        ret
+MON_DUMP1_END:
+
+
+; 先頭セクタの読込み
+MON_LOAD1ST:
+        ld      a, (hl)
+        call    SET_IPLDRV
+        call    IS_FDD_READY
+        call    nc, LOAD1ST_COM
+        jp      EXEC_MON_1
+MON_LOAD1ST_END:
+
+
+; 一行入力
+; [out] A : length
+;       HL : string
+; [destruct] AF BC DE HL
+MON_GETS:
+        ld      hl, INPBUF
+
+MON_GETS_1:
+        call    TXT_CURON
+        call    IPLKEY
+
+        cp      ' '
+        jr      c, MON_GETS_2           ; コントロールコード
+
+        ; 表示可能文字
+        ld      d, a                    ; 退避
+        ld      a, l
+        cp      LOW(INPBUF + INPSIZ - 1)
+        jr      z, MON_GETS_1           ; バッファがいっぱい
+        ld      a, d                    ; 復元
+
+        ld      (hl), a
+        inc     hl
+        call    IPLPTC
+        jr      MON_GETS_1
+
+MON_GETS_2:
+        cp      08h                     ; DEL
+        jr      z, MON_GETS_3
+
+        cp      0dh                     ; CR
+        jr      z, MON_GETS_4
+
+        jr      MON_GETS_1
+
+MON_GETS_3:
+        ; DELの処理
+        ld      a, l
+        cp      LOW(INPBUF)
+        jr      z, MON_GETS_1           ; バッファの先頭
+
+        dec     hl
+        ld      (hl), 0
+        push    hl
+        call    TXT_BS
+        pop     hl
+        jr      MON_GETS_1
+
+MON_GETS_4:
+        ld      (hl), 0
+        call    MON_PRINTS
+        call    TXT_LTNL
+
+        ret
+MON_GETS_END:
+
+
+; 空白を読み飛ばす
+; パラメータ
+;   hl : 文字列アドレス
+; レジスタ破壊 hl
+MON_SKIP_SPC:
+        push    af
+MON_SKIP_SPC_1:
+        ld      a, (hl)
+        cp      ' '
+        jr      nz, MON_SKIP_SPC_2
+        inc     hl
+        jr      MON_SKIP_SPC_1
+MON_SKIP_SPC_2:
+        pop     af
+        ret
+MON_SKIP_SPC_END:
+
 
 
 ; #PRINTS
 ; 空白を1文字表示する
-; [destruct] F
+; レジスタ破壊 af
 MON_PRINTS:
-        push    af
         ld      a, ' '
-        call    IPLPTC
-        pop     af
-        ret
+        jp      IPLPTC
+        ; omit RET
 MON_PRINTS_END:
 
 
 ; #PRTHX
 ; Aレジスタの内容を2桁の16進数として表示する
-; [in]  A : binary
-; [destruct] AF
+; パラメータ
+;   a : 数値
+; レジスタ破壊 af
 MON_PRTHX:
         push    af
         rrca
@@ -1591,9 +2025,10 @@ MON_PRTHX_AND:
 
 
 ; #PRTHL
-; print HL registor as 4 digit HEX
-; [in]  HL : binary
-; [destruct] AF
+; HLレジスタの内容を4桁の16進数として表示する
+; パラメータ
+;   hl : 数値
+; レジスタ破壊 af
 MON_PRTHL:
         ld      a, h
         call    MON_PRTHX
@@ -1604,10 +2039,12 @@ MON_PRTHL_END:
 
 
 ; #ASC
-; binary to ASCII convert
-; [in]  A : binary (low nibble)
-; [out] A : ASCII code ('0' - '9', 'A' - 'F')
-; [destruct] AF
+; Aレジスタの下位4ビットを16進数を表すアスキーコードに変換する
+; パラメータ
+;   a : 数値(下位4ビットが有効)
+; 戻り値
+;   a : ASCII code ('0' - '9', 'A' - 'F')
+; レジスタ破壊 af
 MON_ASC:
         and     0fh
 
@@ -1618,21 +2055,109 @@ MON_ASC:
 
         ret
 MON_ASC_END:
-; ------------------
+
+
+; #HEX
+; 16進数を表す1文字のアスキーコードを4ビットの数値に変換する
+; パラメータ
+;   a : ASCII code ('0' - '9', 'A' - 'F')
+; 戻り値
+;   a : 数値 (0 - 15)
+;   キャリ : エラー時
+; レジスタ破壊 af
+MON_HEX:
+        sub     '0'
+        cp      10
+        jr      c, MON_HEX_1            ; 0-9
+        and     0dfh                    ; 大文字に統一する
+        cp      17h
+        jr      nc, MON_HEX_1           ; over 'F'(46h)
+        cp      11h
+        jr      c, MON_HEX_2            ; 3ah - 40h
+        sub     7                       ; 'A'(41h) - 'F'(46h)
+        scf
+MON_HEX_1:
+        ccf
+MON_HEX_2:
+        ret
+MON_HEX_END:
+
+
+; #2HEX
+; 16進数を表す2文字を8ビットの数値に変換する
+; パラメータ
+;   de : 文字列の先頭アドレス
+; 戻り値
+;   a : 数値 (0 - 255)
+;   キャリ : エラー時
+; レジスタ破壊 af de(+2される)
+MON_2HEX:
+        push    hl
+        call    MON_2HEX_1
+        pop     hl
+        ret
+
+MON_2HEX_1:
+        ld      a, (de)
+        inc     de
+        call    MON_HEX                  ; carry if error
+        ld      l, a
+
+        ld      a, (de)
+        inc     de
+        jr      c, MON_2HEX_2
+
+        call    MON_HEX                  ; carry if error
+        jr      c, MON_2HEX_2
+
+        sla     l
+        sla     l
+        sla     l
+        sla     l
+
+        add     a, l
+
+MON_2HEX_2:
+        ret
+MON_2HEX_END:
+
+
+; #HLHEX
+; 16進数を表す2文字を8ビットの数値に変換する
+; パラメータ
+;   de : 文字列の先頭アドレス
+; 戻り値
+;   hl : 数値 (0 - 65535)
+;   キャリ : エラー時
+; レジスタ破壊 af de(+4される) hl
+MON_HLHEX:
+        call    MON_2HEX_1              ; carry if error
+        jr      c, MON_HLHEX_1
+        ld      h, a
+
+        call    MON_2HEX_1              ; carry if error
+        ld      l, a
+
+        ret
+MON_HLHEX_1:
+        inc     de
+        inc     de
+        ret
+MON_HLHEX_END:
 
 
 ; ----------------------------------------------------------
 ; データ領域
 ; 計384バイト
 ; ----------------------------------------------------------
-        org     0680h
+        org     0a80h
 DATA_TOP:
 
 ; 表示メッセージ
 ; VRAMオフセット(2バイト), "メッセージ本体", 終端0
 MSG_WELCOME:
         dw      40*23+8
-        db      "X1 compatible IPL 0.6.1", 0
+        db      "X1 compatible IPL 0.7.0", 0
 MSG_ERROR:
         dw      40
         db      "Device error", 0
