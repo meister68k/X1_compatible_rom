@@ -1,4 +1,4 @@
-# X1 compatible ROM ver 0.6.1
+# X1 compatible ROM ver 0.7.1
 
 2020-09-26 by Meister  
 2022-02-20 ROMブートの不具合修正，簡易モニタ実装開始
