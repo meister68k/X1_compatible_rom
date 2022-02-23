@@ -40,11 +40,12 @@
 ;                     EMMとROMのルーチン共用をやめ内部構造が大きく変わったため，バージョン番号を上げた
 ;                     デバッグ支援用にモニタの実装を開始
 ; 2022-02-20 ver0.7.1 リファクタリング
-; 2022-02-23 ver0.7.2 8255の設定を追加
+; 2022-02-23 ver0.7.2 8255の初期化を追加
 ;                     X1 Fのデモディスクがおかしいのはこれが原因だった
 ;                     エラーステータス表示を消した(入らないのであきらめた)
 ;                     アドレス固定エントリのorgを減らし，代わりにORG_XXXXラベルを置いた
 ;                     ビルド時に.lstファイルのORG_XXXXラベルをチェックすること
+; 2022-02-23 ver0.7.3 モニタコマンドを実装
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -56,6 +57,7 @@
 ; [4] HuBASIC Format詳細, BouKiCHi, https://boukichi.github.io/HuDisk/HuBASIC_Format.html
 ;   2020-07-31 閲覧
 ; [5] 試験に出ないX1 第０章 まだまだ完全無欠にならないI/Oマップ, X1cetner, http://www.x1center.org/sdx1/sdx1_0.html
+;   2022-02-23 閲覧
 ;
 ; 開発にあたり武田氏のX1エミュレータ eX1 (http://takeda-toshiya.my.coocan.jp/)を
 ; 全面的に使用した。eX1の強力なデバッグ機能のお陰でこのプラグラムを作りえた。
@@ -1394,22 +1396,15 @@ IS_CMT_READY:
 IS_CMT_READY_END:
 
 
-; CMTからのファイルの読込みと実行(後半)
-; 34バイト
+; CMTからのファイル本体の読込みと実行
+; ??バイト
 IPL_CMT:
-        ; ファイル本体の読込み
-        ld      bc, IO8255B
         ld      de, (FILEBUF+12h)       ; プログラムサイズ(byte)
         ld      hl, (FILEBUF+14h)       ; ロードアドレス
-        ld      a, 2                    ; 2=再生コマンド
-        call    MT_CTRL                 ; 再生開始
+        call    MT_CTRL_PLAY            ; 再生開始
         call    CMT_LOADFILE
-        push    af
+        call    MT_CTRL_STOP            ; 停止
 
-        ld      a, 1                    ; 1=停止コマンド
-        call    MT_CTRL                 ; 停止
-
-        pop     af
         jp      c, ERR_LOAD             ; 読込み異常
 
 IPL_CMT_1:
@@ -1419,28 +1414,15 @@ IPL_CMT_1:
 IPL_CMT_END
 
 
+; CMTからのインフォメーションブロックの読込み
 ; 
-; 22バイト
+; ??バイト
 CMT_LOAD1ST:
-        ; IPL中なので割り込み禁止のはず
-;        di                              ; ここから割り込み禁止区間
-        ld      a, 2                    ; 2=再生コマンド
-        call    MT_CTRL                 ; 再生開始
-
         ld      hl, FILEBUF
-        ld      bc, IO8255B
-
+        call    MT_CTRL_PLAY            ; 再生開始
         call    CMT_LOADIFB
-        push    af
-
-        ld      a, 1                    ; 1=停止コマンド
-        call    MT_CTRL                 ; 停止
-;        ei                              ; ここまで割り込み禁止区間
-        ; IPL中なのでずっと割り込み禁止にしてある
-
-        pop     af
-
-        ret
+        jp      MT_CTRL_STOP            ; 停止
+        ; ommit ret
 CMT_LOAD1ST_END:
 
 
@@ -1532,6 +1514,27 @@ CMT_LOADFILE_EXIT:
 
         ret
 CMT_LOADFILE_END:
+
+
+; カセットを再生し，BCレジスタに8255のアドレスをセットする
+; レジスタ破壊 af bc
+MT_CTRL_PLAY:
+        ld      bc, IO8255B
+        ld      a, 2                    ; 2=再生コマンド
+        jp      MT_CTRL
+        ; ommit ret
+MT_CTRL_PLAY_END:
+
+
+; カセット停止
+; レジスタ破壊 af'
+MT_CTRL_STOP:
+        ex      af, af'
+        ld      a, 1                    ; 1=停止コマンド
+        call    MT_CTRL
+        ex      af, af'
+        ret
+MT_CTRL_STOP_END:
 
 
 ; カセットコントロール
@@ -1827,6 +1830,7 @@ MT_RDBYTE_END:
 EXEC_RAM:
         ; リダイレクタをRAMに書き込む
         ld      de, 0
+EXEC_RAM_1:
         call    WRITE_REDIRECTOR
         jp      IPL_LOAD_1              ; IPL終了
 EXEC_RAM_EMD:                           ; アドレス 01e9h
@@ -1853,20 +1857,31 @@ EXEC_MON_1:
         cp      '#'                     ; 画面クリア
         jr      z, EXEC_MON
 
+        cp      'r'                     ; 終了
+        jp      z, IPL_LOOP
+
         cp      'b'                     ; ブートセクタ読込み
         jr      z, MON_LOAD1ST
 
         cp      'd'                     ; ダンプ
         jr      z, MON_DUMP
 
-        cp      'g'                     ; 実行(RAMに切り替え)
-        jr      z, EXEC_MON_1
+        ; 残るコマンドはパラメータの形が同じ
+        ; パラメータ(アドレス指定)をHLに読み込む
+        ex      af, af'
+        ex      de, hl
+        call    MON_HLHEX               ; エラーならキャリ
+        jr      c, EXEC_MON_1
+        ex      af, af'
 
-        cp      'j'                     ; 実行(ROMのまま)
-        jr      z, EXEC_MON_1
+        cp      'e'                     ; 書込み
+        jr      z, MON_EDIT
 
-        cp      'r'                     ; 終了
-        jp      z, IPL_LOOP
+        cp      'j'                     ; 実行(RAMに切り替え)
+        jr      z, MON_JUMP
+
+        cp      'g'                     ; 実行(ROMのまま)
+        call    z, MON_CALLHL
 
         jr      EXEC_MON_1
 EXEC_MON_END:
@@ -1901,21 +1916,66 @@ MON_DUMP_2:
 MON_DUMP_END:
 
 
+; 先頭セクタの読込み
+MON_LOAD1ST:
+        ld      a, (hl)
+        call    SET_IPLDRV
+        call    IS_DRV_RDY
+        call    nc, LOAD1ST_COM
+        jp      EXEC_MON_1
+MON_LOAD1ST_END:
+
+
+; 書込みコマンド
+; パラメータ
+;   hl : パラメータ文字列
+; レジスタ破壊 af bc de hl
+MON_EDIT:
+        push    hl
+
+        call    MON_PRTHL
+        call    MON_COLON
+        call    MON_PRTHXM
+        call    MON_PRINTS
+
+        call    MON_GETS
+        ld      hl, INPBUF
+        ld      a, (hl)
+        or      a
+        ex      de, hl
+        pop     hl
+        jr      z, MON_EDIT_1
+
+        call    MON_2HEX
+        jr      c, EXEC_MON_1
+
+        ld      (hl), a
+MON_EDIT_1:
+        inc     hl
+        jr      MON_EDIT
+MON_EDIT_END:
+
+
+; ジャンプコマンド
+MON_JUMP:
+        ex      de, hl
+        jp      EXEC_RAM_1
+MON_JUMP_END:
+
+
 ; 1行ダンプコマンド
 ; パラメータ
 ;   hl : アドレス
 ; レジスタ破壊 af bc de hl
 MON_DUMP1:
         call    MON_PRTHL
-        ld      a, ':'
-        call    IPLPTC
+        call    MON_COLON
 
         ; 16進表示
         push    hl
         ld      b, 8
 MON_DUMP1_1:
-        ld      a, (hl)
-        call    MON_PRTHX
+        call    MON_PRTHXM
         call    MON_PRINTS
         inc     hl
         djnz    MON_DUMP1_1
@@ -1932,20 +1992,10 @@ MON_DUMP1_2:
         inc     hl
         djnz    MON_DUMP1_2
 
-        call    TXT_LTNL
+        jp      TXT_LTNL
 
-        ret
+        ; omit ret
 MON_DUMP1_END:
-
-
-; 先頭セクタの読込み
-MON_LOAD1ST:
-        ld      a, (hl)
-        call    SET_IPLDRV
-        call    IS_DRV_RDY
-        call    nc, LOAD1ST_COM
-        jp      EXEC_MON_1
-MON_LOAD1ST_END:
 
 
 ; 一行入力
@@ -2008,9 +2058,9 @@ MON_GETS_END:
 ; 空白を読み飛ばす
 ; パラメータ
 ;   hl : 文字列アドレス
-; レジスタ破壊 hl
+; レジスタ破壊 hl af'
 MON_SKIP_SPC:
-        push    af
+        ex      af, af'
 MON_SKIP_SPC_1:
         ld      a, (hl)
         cp      ' '
@@ -2018,9 +2068,41 @@ MON_SKIP_SPC_1:
         inc     hl
         jr      MON_SKIP_SPC_1
 MON_SKIP_SPC_2:
-        pop     af
+        ex      af, af'
         ret
 MON_SKIP_SPC_END:
+
+
+; (HL)の内容を2桁の16進数として表示する
+; パラメータ
+;   (HL) : 数値
+; レジスタ破壊 af
+MON_PRTHXM:
+        ld      a, (hl)
+        jp      MON_PRTHX
+        ; omit RET
+MON_PRTHXM_END:
+
+
+; :を1文字表示する
+; レジスタ破壊 af
+MON_COLON:
+        ld      a, ':'
+        jr      MON_PRINTS_1            ; 1バイト稼ぐため共用
+        ; omit RET
+MON_COLON_END:
+
+
+; ----------------------------------------------------------
+; S-OSっぽいルーチン群
+; ----------------------------------------------------------
+
+; #[HL]
+; HLレジスタのアドレスを間接コール
+MON_CALLHL:
+        push    hl
+        ret
+MON_CALLHL_END:
 
 
 ; #PRINTS
@@ -2028,6 +2110,7 @@ MON_SKIP_SPC_END:
 ; レジスタ破壊 af
 MON_PRINTS:
         ld      a, ' '
+MON_PRINTS_1:
         jp      IPLPTC
         ; omit RET
 MON_PRINTS_END:
@@ -2174,8 +2257,11 @@ MON_HLHEX_1:
         ret
 MON_HLHEX_END:
 
-        ; アドレス 683h
-        ; ここに61バイトあき
+
+        ; プログラム領域ここまで
+PROGRAM_LAST:
+        ; アドレス 06b9h
+        ; ここに7バイトあき
         nop
 
 ; ----------------------------------------------------------
