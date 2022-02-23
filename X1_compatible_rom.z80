@@ -40,6 +40,11 @@
 ;                     EMMとROMのルーチン共用をやめ内部構造が大きく変わったため，バージョン番号を上げた
 ;                     デバッグ支援用にモニタの実装を開始
 ; 2022-02-20 ver0.7.1 リファクタリング
+; 2022-02-23 ver0.7.2 8255の設定を追加
+;                     X1 Fのデモディスクがおかしいのはこれが原因だった
+;                     エラーステータス表示を消した(入らないのであきらめた)
+;                     アドレス固定エントリのorgを減らし，代わりにORG_XXXXラベルを置いた
+;                     ビルド時に.lstファイルのORG_XXXXラベルをチェックすること
 ;
 ; かつて X1エミュの部屋(http://www.turboz.to/)に掲載されていた
 ; ぷにゅ氏作の IPL ver1.01(x1ipl101.zip,IPLROM.z80)を参考にしている
@@ -50,6 +55,7 @@
 ; [3] 試験に出るX1, 祝 一平, 日本ソフトバンク, 1987
 ; [4] HuBASIC Format詳細, BouKiCHi, https://boukichi.github.io/HuDisk/HuBASIC_Format.html
 ;   2020-07-31 閲覧
+; [5] 試験に出ないX1 第０章 まだまだ完全無欠にならないI/Oマップ, X1cetner, http://www.x1center.org/sdx1/sdx1_0.html
 ;
 ; 開発にあたり武田氏のX1エミュレータ eX1 (http://takeda-toshiya.my.coocan.jp/)を
 ; 全面的に使用した。eX1の強力なデバッグ機能のお陰でこのプラグラムを作りえた。
@@ -132,6 +138,7 @@ IOCRTC          equ     1800h           ; CRTC レジスタ
 IO80C49         equ     1900h           ; サブCPU
 IO8255B         equ     1a01h           ; 8255 port B (CMT読出し)
 IO8255C         equ     1a02h           ; 8255 port C
+IO8255L         equ     1a03h           ; 8255 CWR(controL)
 IOIPLOF         equ     1e00h           ; IPL ROM OFF
 IOATTR          equ     2000h           ; アトリビュートVRAM
 IOTEXT          equ     3000h           ; テキストVRAM
@@ -169,26 +176,33 @@ INIT_WORK_END:
         ld      sp, 0                   ; ずれたので再設定
         ld      hl, PARM40              ; CRTCをWIDTH40で初期化
 
+        ; 8255を初期化 (インライン展開済み)
+        ; 7バイト
+INIT_8255:
+        ld      bc, IO8255L
+        ld      a, 82h                  ; ポートBのみ入力
+        out     (c), a
+INIT_8255_END:
+
         ; CRTCを初期化 (インライン展開済み)
         ; パラメータ
         ;   hl : 初期化パラメータの先頭アドレス
         ; レジスタ破壊 af bc hl
         ; 22バイト
-INIT_CRT:
+INIT_CRTC:
         ld      a, 13                   ; CRTCレジスタ番号
-INIT_CRT_1:
+INIT_CRTC_1:
         ld      bc, IOCRTC
         out     (c), a
         inc     c
         inc     b
         outi                            ; outiの仕様に注意
         dec     a
-        jp      p, INIT_CRT_1
+        jp      p, INIT_CRTC_1
 
-        ld      bc, IO8255C
-        ld      a, 40h
-        out     (c), a
-INIT_CRT_END:
+        ld      bc, IO8255C + 100h
+        outi
+INIT_CRTC_END:
 
         call    CLR_PALET
 
@@ -216,19 +230,17 @@ IPL_LOOP2:
         jr      IPL_LOOP
 IPL_LOOP_END:
 
-        ; NMIリセットがアドレス066hとなるよう，調整する
-        ; ここに1バイトあき
-        nop
-
         ; 読込みエラー等 (インライン展開済み)
-        ; 12バイト
+        ; 5バイト
 ERR_LOAD:
-        ld      bc, 3000h + 40 * 2      ; エラーステータス表示位置
-        add     a, 20h
-        out     (c), a
         ld      de, MSG_ERROR
         jr      ERR_MISSING_1
 ERR_LOAD_END:
+
+        ; NMIリセットがアドレス066hとなるよう，調整する
+        ; ここに3バイトあき
+        nop
+        db      0, 0
 
         ; 読み込むべきファイルが見つからないエラー (インライン展開済み)
         ; 9バイト
@@ -240,8 +252,15 @@ ERR_MISSING_1:
         ; ループの戻りをNMIリセットと共用
 
         ; NMIリセットのエントリ(メニューに戻す)
+ORG_0066:
+        ; org     0066h
 RST_066H:
         jr      IPL_LOOP2
+
+
+        ; ここに8バイトあき
+        nop
+        db      0, 0, 0, 0, 0, 0, 0
 
 
 ; パレットの初期化
@@ -710,8 +729,7 @@ WAIT1_1:
 WAIT1_END:
 
 
-        ; ここに8バイトあき
-        nop
+        ; ここにあきなし
 
 
 ; ファイルの読込み(アドレス固定)
@@ -721,7 +739,8 @@ WAIT1_END:
 ;   hl : 読込みバッファのアドレス
 ; レジスタ破壊 af bc de hl af'
 ; 76バイト
-        org     021ah
+ORG_021A:
+        ; org     021ah
 LOADFILE:
         or      a                       ; キャリークリア
         ex      af, af'                 ; aレジスタ退避
@@ -1162,7 +1181,8 @@ KBHIT_END:
 ;   a : KEYコード
 ; レジスタ破壊 af
 ; 15バイト
-        org     038ah
+ORG_038A:
+        ; org     038ah
 IPLKEY:
         push    bc
 
@@ -1267,7 +1287,8 @@ IPL_PUTCHAR_END:
 ;   (0ff80h) TXTCUR カーソルxy
 ; レジスタ破壊 de
 ; 14バイト
-        org     03cbh
+ORG_03CB:
+        ; org     03cbh
 IPLPRN:
         push    bc
         call    LD_TEXT_ADDR
@@ -1291,7 +1312,8 @@ IPLPRN_END:                             ; アドレス 03d9h
 ;   (0ff80h) TXTCUR カーソルxy
 ; レジスタ破壊 なし
 ; 15バイト
-        org     03d9h
+ORG_03D9:
+        ; org     03d9h
 IPLPTC:
         push    af
         call    IPLPTC_1
@@ -2167,7 +2189,7 @@ DATA_TOP:
 ; VRAMオフセット(2バイト), "メッセージ本体", 終端0
 MSG_WELCOME:
         dw      40*23+8
-        db      "X1 compatible IPL 0.7.1", 0
+        db      "X1 compatible IPL 0.7.2", 0
 MSG_ERROR:
         dw      40
         db      "Device error", 0
@@ -2226,10 +2248,12 @@ MSG_ADDR_MENU:
         dw      MSG_MENU8
 
 ; WIDTH40とWIDTH80のCRTC初期化パラメータ
-; レジスタR13から逆順にR0まで
+; レジスタR13から逆順にR0までと，1a02h(8255 ポートC)に設定する値
 ; 28バイト
 PARM40: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 52, 45, 40, 55
+        db      40h
 PARM80: db      0, 0, 0, 0, 7, 0, 28, 25, 2, 31, 56, 89, 80, 111
+        db      00h
 
 DATA_END:
 
